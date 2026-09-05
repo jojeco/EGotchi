@@ -3,17 +3,19 @@ import { useEffect, useState } from 'react';
 import { StyleSheet, Text, View, Button } from 'react-native';
 import Face from './Components/Face';
 
+const DECAY_INTERVAL_MS = 5000;
 
 export default function App() {
   const[currentFace, setCurrentFace] = useState(2)
 
-  useEffect(() => {setTimeout(()=>  tick(), 5000)}, [currentFace])
+  useEffect(() => {
+    const id = setInterval(() => tick(), DECAY_INTERVAL_MS)
+    return () => clearInterval(id)
+  }, [])
 
   const tick = () => {
-    if (currentFace > 0){
-    setCurrentFace(f => f-1)
+    setCurrentFace(f => (f > 0 ? f - 1 : f))
   }
-}
 
 const getHappy = () => {
   if(currentFace < 4) {
