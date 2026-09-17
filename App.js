@@ -1,7 +1,7 @@
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useState } from 'react';
 import { StyleSheet, Text, View, Button } from 'react-native';
-import Face from './Components/Face';
+import Face, { FACE_COUNT, FACE_LABELS } from './Components/Face';
 
 const DECAY_INTERVAL_MS = 5000;
 
@@ -18,18 +18,16 @@ export default function App() {
   }
 
 const getHappy = () => {
-  if(currentFace < 4) {
-    setCurrentFace(f => f +1)
-  }
+  setCurrentFace(f => (f < FACE_COUNT - 1 ? f + 1 : f))
 }
 
   return (
     <View style={styles.container}>
-      <Text>This is an app</Text>
+      <Text style={styles.mood}>{FACE_LABELS[currentFace]}</Text>
       <Face whichFace={currentFace}/>
-      <Button 
-      title='Click me Please'
-      onPress={() => {getHappy()}}
+      <Button
+      title='Pet'
+      onPress={getHappy}
       />
       <StatusBar style="auto" />
     </View>
@@ -42,5 +40,10 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  mood: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    marginBottom: 12,
   },
 });
