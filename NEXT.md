@@ -25,6 +25,9 @@
   (`@react-native-async-storage/async-storage` via `createAsyncStorageAdapter`; needs a
   dependency addition, so flag to a human first).
 - Evolution stages driven by long-run average care, layered on `getMoodIndex`.
-- A sickness/neglect state when any stat sits at 0 across several ticks.
+- [x] A sickness/neglect state when any stat sits at 0 across several ticks. Done: `game/petState.js`
+  tracks `zeroSince`/`sick` (with an exact offline zero-crossing timestamp, not just "now"), the
+  pet goes Sick after 2 minutes at 0 and stays Sick until every stat is back up to 40, and a new
+  `Components/SickBanner.js` shows it in `App.js`.
 - Add a small component/integration test (or at least a bundle check) for `App.js`; today
   only the pure `game/` modules are covered.

@@ -21,6 +21,8 @@ Buttons are disabled (and show the seconds left) while an action is cooling down
 
 Decay is timestamp-based, so time that passes while the app is closed is applied on the next load. Offline decay is capped at 12 hours so a pet is never permanently wiped out by a long absence.
 
+Neglect a stat for too long and the pet gets sick. If any stat sits at 0 for two straight minutes, a "Sick!" banner appears and the pet's mood is capped near the bottom of the range no matter how good its other stats look. Sickness doesn't clear the moment the neglected stat is topped back up — every stat has to climb back to at least 40 before the pet recovers. This check runs on the same timestamp-based decay as everything else, so a pet left closed for hours comes back correctly marked sick (or not) based on exactly when a stat would have hit zero, not just whether it's at zero right now.
+
 ## Persistence
 
 The persistence layer is built and unit tested: `game/petState.js` serializes and deserializes the pet (versioned, falls back to a fresh pet on bad data), and `game/storage.js` provides `loadPet`/`savePet` on top of an injectable storage adapter (memory, localStorage, or an AsyncStorage-like module).

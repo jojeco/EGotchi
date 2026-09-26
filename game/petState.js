@@ -8,6 +8,12 @@ const MAX_OFFLINE_MS = 12 * 3600e3
 const SAVE_VERSION = 1
 const STAT_KEYS = ['fullness', 'energy', 'fun']
 
+// Neglect/sickness: a stat sitting at 0 this long makes the pet sick; it stays sick until every
+// stat is brought back up to RECOVER_THRESHOLD, even if the zeroed stat is lifted off 0 first.
+const SICK_AFTER_MS = 2 * 60e3
+const RECOVER_THRESHOLD = 40
+const SICK_MOOD_CAP = 1
+
 // Points lost per minute for each stat.
 const DECAY_PER_MINUTE = { fullness: 6, energy: 4, fun: 5 }
 
@@ -24,16 +30,47 @@ function clampStat(n) {
 }
 
 function createPet(now = Date.now()) {
-  return { fullness: 70, energy: 70, fun: 70, updatedAt: now, lastActionAt: { feed: 0, play: 0, rest: 0 } }
+  return {
+    fullness: 70,
+    energy: 70,
+    fun: 70,
+    updatedAt: now,
+    lastActionAt: { feed: 0, play: 0, rest: 0 },
+    zeroSince: null,
+    sick: false,
+  }
+}
+
+// Pure: derives zeroSince/sick from the stats already on `pet`. Sickness is sticky — it only
+// clears once every stat has climbed back up to RECOVER_THRESHOLD, never just because zeroSince
+// reset to null.
+function updateHealth(pet, now) {
+  const anyZero = STAT_KEYS.some(k => pet[k] <= STAT_MIN)
+  let zeroSince = anyZero ? (typeof pet.zeroSince === 'number' ? pet.zeroSince : now) : null
+  let sick = pet.sick === true || (zeroSince !== null && now - zeroSince >= SICK_AFTER_MS)
+  if (STAT_KEYS.every(k => pet[k] >= RECOVER_THRESHOLD)) sick = false
+  return { ...pet, zeroSince, sick }
 }
 
 function applyDecay(pet, now) {
   const elapsed = Math.min(Math.max(now - pet.updatedAt, 0), MAX_OFFLINE_MS)
   const next = { ...pet, lastActionAt: { ...pet.lastActionAt }, updatedAt: now }
+  let earliestCrossing = null
   for (const k of STAT_KEYS) {
-    next[k] = clampStat(pet[k] - (DECAY_PER_MINUTE[k] * elapsed) / 60000)
+    const rate = DECAY_PER_MINUTE[k] / 60000
+    next[k] = clampStat(pet[k] - rate * elapsed)
+    if (next[k] <= STAT_MIN && rate > 0) {
+      // Exact moment this stat crossed zero, anchored on pet.updatedAt (not `now`) so a capped
+      // offline gap can't shift it. A stat already at 0 before this tick gives offset 0.
+      const offsetMs = Math.min(pet[k] / rate, elapsed)
+      const crossing = pet.updatedAt + offsetMs
+      if (earliestCrossing === null || crossing < earliestCrossing) earliestCrossing = crossing
+    }
   }
-  return next
+  if (typeof pet.zeroSince !== 'number' && earliestCrossing !== null) {
+    next.zeroSince = earliestCrossing
+  }
+  return updateHealth(next, now)
 }
 
 function getCooldownRemaining(pet, actionId, now) {
@@ -57,12 +94,13 @@ function applyAction(pet, actionId, now) {
   const check = canDoAction(pet, actionId, now)
   if (!check.allowed) return { pet, applied: false, reason: check.reason }
   const action = ACTIONS[actionId]
-  const next = applyDecay(pet, now)
+  const decayed = applyDecay(pet, now)
+  const next = { ...decayed, lastActionAt: { ...decayed.lastActionAt } }
   for (const k of STAT_KEYS) {
     next[k] = clampStat(next[k] + action.effects[k])
   }
   next.lastActionAt[actionId] = now
-  return { pet: next, applied: true, reason: 'ok' }
+  return { pet: updateHealth(next, now), applied: true, reason: 'ok' }
 }
 
 function getAverage(pet) {
@@ -71,7 +109,12 @@ function getAverage(pet) {
 
 function getMoodIndex(pet) {
   const idx = Math.floor(getAverage(pet) / (STAT_MAX / MOOD_COUNT))
-  return Math.min(Math.max(idx, 0), MOOD_COUNT - 1)
+  const clamped = Math.min(Math.max(idx, 0), MOOD_COUNT - 1)
+  return pet.sick === true ? Math.min(clamped, SICK_MOOD_CAP) : clamped
+}
+
+function isSick(pet) {
+  return pet.sick === true
 }
 
 function serialize(pet) {
@@ -102,6 +145,10 @@ function deserialize(raw, now = Date.now()) {
       fun: clampStat(p.fun),
       updatedAt: p.updatedAt,
       lastActionAt,
+      sick: p.sick === true,
+      zeroSince: (typeof p.zeroSince === 'number' && Number.isFinite(p.zeroSince))
+        ? Math.min(p.zeroSince, p.updatedAt)
+        : null,
     }
   } catch (e) {
     return createPet(now)
@@ -117,14 +164,19 @@ module.exports = {
   STAT_KEYS,
   DECAY_PER_MINUTE,
   ACTIONS,
+  SICK_AFTER_MS,
+  RECOVER_THRESHOLD,
+  SICK_MOOD_CAP,
   clampStat,
   createPet,
+  updateHealth,
   applyDecay,
   getCooldownRemaining,
   canDoAction,
   applyAction,
   getAverage,
   getMoodIndex,
+  isSick,
   serialize,
   deserialize,
 }

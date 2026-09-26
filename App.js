@@ -4,6 +4,7 @@ import { StyleSheet, Text, View } from 'react-native';
 import Face, { FACE_LABELS } from './Components/Face';
 import StatBar from './Components/StatBar';
 import ActionButtons from './Components/ActionButtons';
+import SickBanner from './Components/SickBanner';
 import petState from './game/petState';
 import storage from './game/storage';
 
@@ -82,6 +83,7 @@ export default function App() {
   return (
     <View style={styles.container}>
       <Text style={styles.mood}>{FACE_LABELS[petState.getMoodIndex(pet)]}</Text>
+      <SickBanner visible={petState.isSick(pet)} threshold={petState.RECOVER_THRESHOLD}/>
       <Face whichFace={petState.getMoodIndex(pet)}/>
       <View style={styles.stats}>
         <StatBar label='Fullness' value={pet.fullness} color='#ff9800'/>

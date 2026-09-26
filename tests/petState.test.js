@@ -12,8 +12,9 @@ const test = (name, fn) => tests.push({ name, fn })
 
 test('petState exports every symbol App.js and storage.js rely on', () => {
   const names = ['STAT_MIN', 'STAT_MAX', 'MOOD_COUNT', 'MAX_OFFLINE_MS', 'SAVE_VERSION', 'STAT_KEYS',
-    'DECAY_PER_MINUTE', 'ACTIONS', 'clampStat', 'createPet', 'applyDecay', 'getCooldownRemaining',
-    'canDoAction', 'applyAction', 'getAverage', 'getMoodIndex', 'serialize', 'deserialize']
+    'DECAY_PER_MINUTE', 'ACTIONS', 'SICK_AFTER_MS', 'RECOVER_THRESHOLD', 'SICK_MOOD_CAP', 'clampStat',
+    'createPet', 'updateHealth', 'applyDecay', 'getCooldownRemaining', 'canDoAction', 'applyAction',
+    'getAverage', 'getMoodIndex', 'isSick', 'serialize', 'deserialize']
   for (const n of names) assert.notStrictEqual(petState[n], undefined, 'petState missing ' + n)
 })
 
@@ -140,6 +141,134 @@ test('getMoodIndex at 0 / 50 / 100 and always in range', () => {
   assert.strictEqual(petState.getMoodIndex(at(50)), 2)
   assert.strictEqual(petState.getMoodIndex(at(100)), petState.MOOD_COUNT - 1)
   assert.strictEqual(petState.getAverage(at(40)), 40)
+})
+
+test('sick after SICK_AFTER_MS at 0, not before — stepped ticks and one big jump agree', () => {
+  const base = {
+    fullness: 6, energy: 100, fun: 100, updatedAt: T0,
+    lastActionAt: { feed: 0, play: 0, rest: 0 }, zeroSince: null, sick: false,
+  }
+  // fullness decays 6/min -> crosses 0 at T0+60000. Sick threshold is T0+60000+SICK_AFTER_MS = T0+180000.
+  const beforeAt = T0 + 180000 - 5000
+  const afterAt = T0 + 180000 + 5000
+
+  let stepped = base
+  let now = T0
+  while (now < beforeAt) {
+    now += 1000
+    stepped = petState.applyDecay(stepped, Math.min(now, beforeAt))
+  }
+  assert.strictEqual(stepped.updatedAt, beforeAt)
+  assert.strictEqual(stepped.sick, false, 'stepped: not sick 5s before threshold')
+
+  while (now < afterAt) {
+    now += 1000
+    stepped = petState.applyDecay(stepped, Math.min(now, afterAt))
+  }
+  assert.strictEqual(stepped.updatedAt, afterAt)
+  assert.strictEqual(stepped.sick, true, 'stepped: sick 5s past threshold')
+
+  const jumpBefore = petState.applyDecay(base, beforeAt)
+  const jumpAfter = petState.applyDecay(base, afterAt)
+  assert.strictEqual(jumpBefore.sick, false, 'jump: not sick 5s before threshold')
+  assert.strictEqual(jumpAfter.sick, true, 'jump: sick 5s past threshold')
+})
+
+test('applyDecay computes the exact offline zero-crossing timestamp, not "now" or the gap start', () => {
+  const base = {
+    fullness: 6, energy: 100, fun: 100, updatedAt: T0,
+    lastActionAt: { feed: 0, play: 0, rest: 0 }, zeroSince: null, sick: false,
+  }
+  // fullness (rate 6/min) crosses 0 at exactly T0+60000, regardless of how far past that the
+  // single offline gap runs.
+  const next = petState.applyDecay(base, T0 + 180000)
+  assert.strictEqual(next.fullness, 0)
+  assert.strictEqual(next.zeroSince, T0 + 60000)
+  assert.notStrictEqual(next.zeroSince, T0)
+  assert.notStrictEqual(next.zeroSince, T0 + 180000)
+  assert.strictEqual(next.sick, true)
+})
+
+test('sickness is sticky: an action lifting the zeroed stat off 0 clears zeroSince but not sick', () => {
+  const sickPet = {
+    fullness: 0, energy: 50, fun: 50, updatedAt: T0,
+    lastActionAt: { feed: 0, play: 0, rest: 0 }, zeroSince: T0 - 200000, sick: true,
+  }
+  const res = petState.applyAction(sickPet, 'feed', T0)
+  assert.strictEqual(res.applied, true)
+  assert.ok(res.pet.fullness > 0, 'feed must lift fullness off 0')
+  assert.strictEqual(res.pet.zeroSince, null, 'zeroSince clears once no stat is at 0')
+  assert.strictEqual(res.pet.sick, true, 'sick stays true even though zeroSince cleared')
+})
+
+test('recovery only clears sick once ALL stats are >= RECOVER_THRESHOLD', () => {
+  const partial = {
+    fullness: 50, energy: 50, fun: 39, updatedAt: T0,
+    lastActionAt: { feed: 0, play: 0, rest: 0 }, zeroSince: null, sick: true,
+  }
+  const stillSick = petState.updateHealth(partial, T0 + 1000)
+  assert.strictEqual(stillSick.sick, true, 'one stat below RECOVER_THRESHOLD keeps it sick')
+
+  const fullyRecovered = { ...partial, fun: petState.RECOVER_THRESHOLD }
+  const cured = petState.updateHealth(fullyRecovered, T0 + 1000)
+  assert.strictEqual(cured.sick, false, 'every stat at/above RECOVER_THRESHOLD clears sick')
+})
+
+test('getMoodIndex is capped at SICK_MOOD_CAP while sick, unaffected otherwise', () => {
+  const maxedSick = { ...petState.createPet(T0), fullness: 100, energy: 100, fun: 100, sick: true }
+  assert.strictEqual(petState.getMoodIndex(maxedSick), petState.SICK_MOOD_CAP)
+  const maxedHealthy = { ...maxedSick, sick: false }
+  assert.strictEqual(petState.getMoodIndex(maxedHealthy), petState.MOOD_COUNT - 1)
+  assert.strictEqual(petState.isSick(maxedSick), true)
+  assert.strictEqual(petState.isSick(maxedHealthy), false)
+})
+
+test('deserialize migrates an old save with no sick/zeroSince fields at all', () => {
+  const raw = JSON.stringify({
+    version: 1,
+    pet: { fullness: 33, energy: 44, fun: 55, updatedAt: T0, lastActionAt: { feed: 1, play: 2, rest: 3 } },
+  })
+  const result = petState.deserialize(raw, T0 + 999)
+  assert.strictEqual(result.fullness, 33)
+  assert.strictEqual(result.energy, 44)
+  assert.strictEqual(result.fun, 55)
+  assert.strictEqual(result.updatedAt, T0)
+  assert.deepStrictEqual(result.lastActionAt, { feed: 1, play: 2, rest: 3 })
+  assert.strictEqual(result.sick, false)
+  assert.strictEqual(result.zeroSince, null)
+})
+
+test('deserialize coerces garbage sick/zeroSince values without a full reset', () => {
+  const rawGarbage = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 60, energy: 61, fun: 62, updatedAt: T0,
+      lastActionAt: { feed: 0, play: 0, rest: 0 }, sick: 'yes', zeroSince: 'not a number',
+    },
+  })
+  const resGarbage = petState.deserialize(rawGarbage, T0 + 1)
+  assert.strictEqual(resGarbage.fullness, 60, 'garbage new fields must not trigger a full reset')
+  assert.strictEqual(resGarbage.sick, false)
+  assert.strictEqual(resGarbage.zeroSince, null)
+
+  const rawFuture = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 70, energy: 70, fun: 70, updatedAt: T0,
+      lastActionAt: { feed: 0, play: 0, rest: 0 }, zeroSince: T0 + 999999,
+    },
+  })
+  const resFuture = petState.deserialize(rawFuture, T0 + 1)
+  assert.strictEqual(resFuture.updatedAt, T0, 'sanity: not the fresh-pet fallback')
+  assert.strictEqual(resFuture.zeroSince, T0, 'a future zeroSince is clamped down to updatedAt')
+})
+
+test('serialize -> deserialize round-trips sick:true and a non-null zeroSince exactly', () => {
+  const pet = {
+    fullness: 20, energy: 60, fun: 80, updatedAt: T0 + 50000,
+    lastActionAt: { feed: 0, play: 0, rest: 0 }, zeroSince: T0 + 12345, sick: true,
+  }
+  assert.deepStrictEqual(petState.deserialize(petState.serialize(pet), T0), pet)
 })
 
 test('serialize -> deserialize round-trips', () => {
