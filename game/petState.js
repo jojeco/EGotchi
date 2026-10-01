@@ -17,6 +17,21 @@ const SICK_MOOD_CAP = 1
 // Points lost per minute for each stat.
 const DECAY_PER_MINUTE = { fullness: 6, energy: 4, fun: 5 }
 
+// Evolution: stage is driven by cumulative care-time (ageMs), which only advances via
+// applyDecay's capped `elapsed` so it respects MAX_OFFLINE_MS the same as everything else. The
+// adult form is a one-time snapshot of the long-run care average (careSum/ageMs) taken at the
+// Teen->Adult transition; once set it never changes again, even if the pet is neglected after.
+const STAGES = ['egg', 'baby', 'child', 'teen', 'adult']
+const STAGE_AGE_MS = { egg: 0, baby: 2 * 60e3, child: 10 * 60e3, teen: 30 * 60e3, adult: 60 * 60e3 }
+const ADULT_FORMS = [
+  { id: 'radiant', label: 'Radiant', minCare: 70 },
+  { id: 'steady', label: 'Steady', minCare: 40 },
+  { id: 'scruffy', label: 'Scruffy', minCare: 0 },
+]
+// While sick, each care sample feeding into the long-run average is capped low so a pet can't
+// coast into a good adult form just by being topped-up right at the Teen->Adult instant.
+const SICK_CARE_CAP = 20
+
 const ACTIONS = {
   feed: { id: 'feed', label: 'Feed', cooldownMs: 20000, effects: { fullness: 25, energy: -2, fun: 2 } },
   play: { id: 'play', label: 'Play', cooldownMs: 15000, effects: { fullness: -8, energy: -12, fun: 25 } },
@@ -38,6 +53,10 @@ function createPet(now = Date.now()) {
     lastActionAt: { feed: 0, play: 0, rest: 0 },
     zeroSince: null,
     sick: false,
+    ageMs: 0,
+    careSum: 0,
+    stage: 'egg',
+    adultForm: null,
   }
 }
 
@@ -50,6 +69,49 @@ function updateHealth(pet, now) {
   let sick = pet.sick === true || (zeroSince !== null && now - zeroSince >= SICK_AFTER_MS)
   if (STAT_KEYS.every(k => pet[k] >= RECOVER_THRESHOLD)) sick = false
   return { ...pet, zeroSince, sick }
+}
+
+// Pure: derives stage/adultForm from ageMs (and, once, the long-run care average). Stage never
+// moves backwards — it's the max of the pet's current stage index and whatever ageMs alone
+// implies. adultForm is computed exactly once, the first time `stage` reaches 'adult' while
+// adultForm is still null; after that it's left untouched no matter what the pet does next.
+function updateStage(pet) {
+  const currentIndex = Math.max(STAGES.indexOf(pet.stage), 0)
+  let computedIndex = 0
+  for (let i = 1; i < STAGES.length; i++) {
+    if (pet.ageMs >= STAGE_AGE_MS[STAGES[i]]) computedIndex = i
+  }
+  const index = Math.max(currentIndex, computedIndex)
+  const stage = STAGES[index]
+  // A non-adult can't already have a form (only reachable via a tampered save); drop it so the
+  // real care average decides the form at the Teen->Adult transition.
+  let adultForm = stage === 'adult' ? pet.adultForm : null
+  if (stage === 'adult' && (adultForm === null || adultForm === undefined)) {
+    const avgCare = getAverageCare(pet)
+    const form = ADULT_FORMS.find(f => avgCare >= f.minCare) || ADULT_FORMS[ADULT_FORMS.length - 1]
+    adultForm = form.id
+  }
+  return { ...pet, stage, adultForm }
+}
+
+// Pure: the long-run average care level over the pet's whole life so far.
+function getAverageCare(pet) {
+  return pet.ageMs === 0 ? getAverage(pet) : pet.careSum / pet.ageMs
+}
+
+// Pure: a render-friendly summary of where the pet is in its lifecycle.
+function getStageInfo(pet) {
+  const index = Math.max(STAGES.indexOf(pet.stage), 0)
+  const stage = STAGES[index]
+  const adultForm = pet.adultForm || null
+  let label = stage.charAt(0).toUpperCase() + stage.slice(1)
+  if (stage === 'adult' && adultForm) {
+    const form = ADULT_FORMS.find(f => f.id === adultForm)
+    if (form) label = label + ' · ' + form.label
+  }
+  const nextStage = index < STAGES.length - 1 ? STAGES[index + 1] : null
+  const msToNext = nextStage === null ? null : Math.max(STAGE_AGE_MS[nextStage] - pet.ageMs, 0)
+  return { stage, index, label, adultForm, nextStage, msToNext }
 }
 
 function applyDecay(pet, now) {
@@ -70,7 +132,15 @@ function applyDecay(pet, now) {
   if (typeof pet.zeroSince !== 'number' && earliestCrossing !== null) {
     next.zeroSince = earliestCrossing
   }
-  return updateHealth(next, now)
+  // Integrate care (trapezoid of the average stat level across this tick) into ageMs/careSum.
+  // When elapsed is 0 (including now < updatedAt) this is a no-op: ageMs gets +0 and careSum
+  // gets +0, same as every other field in that case.
+  const sickCapped = pet.sick === true
+  const avgBefore = sickCapped ? Math.min(getAverage(pet), SICK_CARE_CAP) : getAverage(pet)
+  const avgAfter = sickCapped ? Math.min(getAverage(next), SICK_CARE_CAP) : getAverage(next)
+  next.ageMs = pet.ageMs + elapsed
+  next.careSum = pet.careSum + ((avgBefore + avgAfter) / 2) * elapsed
+  return updateHealth(updateStage(next), now)
 }
 
 function getCooldownRemaining(pet, actionId, now) {
@@ -139,7 +209,15 @@ function deserialize(raw, now = Date.now()) {
       if (t !== undefined && !isFiniteNumber(t)) return createPet(now)
       lastActionAt[id] = t === undefined ? 0 : t
     }
-    return {
+    // Evolution fields: coerce missing/garbage values to safe defaults without resetting the
+    // rest of the pet (same pattern as the sick/zeroSince migration above). An old save with none
+    // of these fields loads with its stats intact and starts as Egg at age 0.
+    const ageMs = (isFiniteNumber(p.ageMs) && p.ageMs >= 0) ? p.ageMs : 0
+    const careSumRaw = (isFiniteNumber(p.careSum) && p.careSum >= 0) ? p.careSum : 0
+    const careSum = Math.min(careSumRaw, ageMs * STAT_MAX)
+    const stage = STAGES.includes(p.stage) ? p.stage : 'egg'
+    const adultForm = ADULT_FORMS.some(f => f.id === p.adultForm) ? p.adultForm : null
+    const pet = {
       fullness: clampStat(p.fullness),
       energy: clampStat(p.energy),
       fun: clampStat(p.fun),
@@ -149,7 +227,15 @@ function deserialize(raw, now = Date.now()) {
       zeroSince: (typeof p.zeroSince === 'number' && Number.isFinite(p.zeroSince))
         ? Math.min(p.zeroSince, p.updatedAt)
         : null,
+      ageMs,
+      careSum,
+      stage,
+      adultForm,
     }
+    // Reconcile stage/adultForm against ageMs (handles inconsistent/tampered combinations the
+    // same way a live pet's applyDecay would: stage never moves backwards, adultForm is only
+    // ever computed once).
+    return updateStage(pet)
   } catch (e) {
     return createPet(now)
   }
@@ -167,14 +253,21 @@ module.exports = {
   SICK_AFTER_MS,
   RECOVER_THRESHOLD,
   SICK_MOOD_CAP,
+  STAGES,
+  STAGE_AGE_MS,
+  ADULT_FORMS,
+  SICK_CARE_CAP,
   clampStat,
   createPet,
   updateHealth,
+  updateStage,
   applyDecay,
   getCooldownRemaining,
   canDoAction,
   applyAction,
   getAverage,
+  getAverageCare,
+  getStageInfo,
   getMoodIndex,
   isSick,
   serialize,

@@ -24,7 +24,13 @@
   resets on every app restart there. Wire a real backend
   (`@react-native-async-storage/async-storage` via `createAsyncStorageAdapter`; needs a
   dependency addition, so flag to a human first).
-- Evolution stages driven by long-run average care, layered on `getMoodIndex`.
+- [x] Evolution stages driven by long-run average care, layered on `getMoodIndex`. Done:
+  `game/petState.js` ages the pet through Egg -> Baby -> Child -> Teen -> Adult based on `ageMs`
+  (cumulative time seen by `applyDecay`, so it respects the `MAX_OFFLINE_MS` cap the same as
+  decay/sickness do), picks one of three adult forms (Radiant/Steady/Scruffy) from the long-run
+  care average exactly once at the Teen->Adult transition, and never regresses a stage once
+  reached. `Components/StageBadge.js` shows the current stage/form and time-to-next-stage in
+  `App.js`, with a brief "Evolved!" banner on the tick/action that crosses a boundary.
 - [x] A sickness/neglect state when any stat sits at 0 across several ticks. Done: `game/petState.js`
   tracks `zeroSince`/`sick` (with an exact offline zero-crossing timestamp, not just "now"), the
   pet goes Sick after 2 minutes at 0 and stays Sick until every stat is back up to 40, and a new

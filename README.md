@@ -23,6 +23,20 @@ Decay is timestamp-based, so time that passes while the app is closed is applied
 
 Neglect a stat for too long and the pet gets sick. If any stat sits at 0 for two straight minutes, a "Sick!" banner appears and the pet's mood is capped near the bottom of the range no matter how good its other stats look. Sickness doesn't clear the moment the neglected stat is topped back up — every stat has to climb back to at least 40 before the pet recovers. This check runs on the same timestamp-based decay as everything else, so a pet left closed for hours comes back correctly marked sick (or not) based on exactly when a stat would have hit zero, not just whether it's at zero right now.
 
+## Evolution
+
+The pet ages through five stages — **Egg → Baby → Child → Teen → Adult** — driven by cumulative care-time (the same timestamp-based `elapsed` that drives decay, so it's also capped by `MAX_OFFLINE_MS`; a long offline gap can't fast-forward the pet past more than 12 hours of aging). A stage, once reached, never goes back down.
+
+At the Teen → Adult transition the pet locks in one of three adult forms, based on its long-run average care level (`careSum / ageMs`) up to that point:
+
+| Form | Long-run average care |
+| --- | --- |
+| Radiant | 70+ |
+| Steady | 40+ |
+| Scruffy | below 40 |
+
+Once an adult form is set it's permanent — later neglect (or later great care) no longer changes it. Time spent sick counts for less: each care sample taken while the pet is sick is capped at 20, so riding out sickness doesn't inflate the long-run average. `Components/StageBadge.js` shows the current stage (plus form, once adult) and a countdown to the next stage, with a brief "Evolved!" highlight the moment a boundary is crossed.
+
 ## Persistence
 
 The persistence layer is built and unit tested: `game/petState.js` serializes and deserializes the pet (versioned, falls back to a fresh pet on bad data), and `game/storage.js` provides `loadPet`/`savePet` on top of an injectable storage adapter (memory, localStorage, or an AsyncStorage-like module).

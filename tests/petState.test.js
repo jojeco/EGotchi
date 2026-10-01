@@ -12,9 +12,11 @@ const test = (name, fn) => tests.push({ name, fn })
 
 test('petState exports every symbol App.js and storage.js rely on', () => {
   const names = ['STAT_MIN', 'STAT_MAX', 'MOOD_COUNT', 'MAX_OFFLINE_MS', 'SAVE_VERSION', 'STAT_KEYS',
-    'DECAY_PER_MINUTE', 'ACTIONS', 'SICK_AFTER_MS', 'RECOVER_THRESHOLD', 'SICK_MOOD_CAP', 'clampStat',
-    'createPet', 'updateHealth', 'applyDecay', 'getCooldownRemaining', 'canDoAction', 'applyAction',
-    'getAverage', 'getMoodIndex', 'isSick', 'serialize', 'deserialize']
+    'DECAY_PER_MINUTE', 'ACTIONS', 'SICK_AFTER_MS', 'RECOVER_THRESHOLD', 'SICK_MOOD_CAP',
+    'STAGES', 'STAGE_AGE_MS', 'ADULT_FORMS', 'SICK_CARE_CAP', 'clampStat',
+    'createPet', 'updateHealth', 'updateStage', 'applyDecay', 'getCooldownRemaining', 'canDoAction',
+    'applyAction', 'getAverage', 'getAverageCare', 'getStageInfo', 'getMoodIndex', 'isSick',
+    'serialize', 'deserialize']
   for (const n of names) assert.notStrictEqual(petState[n], undefined, 'petState missing ' + n)
 })
 
@@ -46,6 +48,12 @@ test('App.js blocks actions until the saved pet has loaded', () => {
     'ActionButtons must be passed disabled={!ready} so buttons dim until the load resolves')
 })
 
+test('App.js computes stageInfo and renders StageBadge under the mood label', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'App.js'), 'utf8')
+  assert.ok(/getStageInfo/.test(src), 'App.js must compute stageInfo via petState.getStageInfo')
+  assert.ok(/<StageBadge\b/.test(src), 'App.js must render <StageBadge>')
+})
+
 test('ActionButtons honours an explicit disabled prop as well as cooldowns', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'Components', 'ActionButtons.js'), 'utf8')
   assert.ok(/\{\s*actions\s*,\s*onPress\s*,\s*cooldowns\s*,\s*disabled\s*\}/.test(src),
@@ -58,6 +66,19 @@ test('createPet starts at 70/70/70', () => {
   const pet = petState.createPet(T0)
   assert.deepStrictEqual([pet.fullness, pet.energy, pet.fun], [70, 70, 70])
   assert.strictEqual(pet.updatedAt, T0)
+})
+
+test('createPet starts as Egg at age 0', () => {
+  const pet = petState.createPet(T0)
+  assert.strictEqual(pet.stage, 'egg')
+  assert.strictEqual(pet.ageMs, 0)
+  assert.strictEqual(pet.careSum, 0)
+  assert.strictEqual(pet.adultForm, null)
+  const info = petState.getStageInfo(pet)
+  assert.strictEqual(info.stage, 'egg')
+  assert.strictEqual(info.index, 0)
+  assert.strictEqual(info.label, 'Egg')
+  assert.strictEqual(info.nextStage, 'baby')
 })
 
 test('decay over 10 minutes', () => {
@@ -89,11 +110,203 @@ test('30-day gap equals 12-hour gap (MAX_OFFLINE_MS cap)', () => {
   for (const k of petState.STAT_KEYS) assert.strictEqual(long[k], capped[k])
 })
 
+test('30-day offline gap ages (ageMs/careSum/stage) identically to the 12h MAX_OFFLINE_MS cap', () => {
+  const pet = petState.createPet(T0)
+  const long = petState.applyDecay(pet, T0 + 30 * 24 * 3600e3)
+  const capped = petState.applyDecay(pet, T0 + petState.MAX_OFFLINE_MS)
+  assert.strictEqual(long.ageMs, capped.ageMs)
+  assert.strictEqual(long.ageMs, petState.MAX_OFFLINE_MS)
+  assert.strictEqual(long.careSum, capped.careSum)
+  assert.strictEqual(long.stage, capped.stage)
+  assert.strictEqual(long.adultForm, capped.adultForm)
+})
+
+test('updateStage: just-below and at each STAGE_AGE_MS boundary', () => {
+  for (let i = 1; i < petState.STAGES.length; i++) {
+    const stageName = petState.STAGES[i]
+    const boundary = petState.STAGE_AGE_MS[stageName]
+    const prevStage = petState.STAGES[i - 1]
+    const below = petState.updateStage({ ...petState.createPet(T0), stage: prevStage, ageMs: boundary - 1 })
+    assert.strictEqual(below.stage, prevStage, stageName + ': just below the boundary must not advance')
+    const at = petState.updateStage({ ...petState.createPet(T0), stage: prevStage, ageMs: boundary })
+    assert.strictEqual(at.stage, stageName, stageName + ': exactly at the boundary must advance')
+  }
+})
+
+test('applyDecay stage transition: stepped ticks and one big jump agree at the baby boundary', () => {
+  const base = petState.createPet(T0)
+  const boundary = petState.STAGE_AGE_MS.baby
+  const beforeAt = T0 + boundary - 5000
+  const afterAt = T0 + boundary + 5000
+
+  let stepped = base
+  let now = T0
+  while (now < beforeAt) {
+    now += 1000
+    stepped = petState.applyDecay(stepped, Math.min(now, beforeAt))
+  }
+  assert.strictEqual(stepped.stage, 'egg', 'stepped: still Egg 5s before the baby boundary')
+
+  while (now < afterAt) {
+    now += 1000
+    stepped = petState.applyDecay(stepped, Math.min(now, afterAt))
+  }
+  assert.strictEqual(stepped.stage, 'baby', 'stepped: Baby 5s past the boundary')
+
+  const jumpBefore = petState.applyDecay(base, beforeAt)
+  const jumpAfter = petState.applyDecay(base, afterAt)
+  assert.strictEqual(jumpBefore.stage, 'egg', 'jump: still Egg 5s before the boundary')
+  assert.strictEqual(jumpAfter.stage, 'baby', 'jump: Baby 5s past the boundary')
+  assert.strictEqual(stepped.ageMs, jumpAfter.ageMs, 'stepped and single-jump ageMs must agree')
+})
+
+test('stage never regresses, even when updateStage sees a stale/lower ageMs', () => {
+  const advanced = { ...petState.createPet(T0), stage: 'teen', ageMs: petState.STAGE_AGE_MS.teen, adultForm: null }
+  const result = petState.updateStage({ ...advanced, ageMs: 1000 })
+  assert.strictEqual(result.stage, 'teen', 'updateStage must not move backwards from the current stage')
+})
+
+test('adult form is chosen from the long-run care average at the Teen->Adult transition', () => {
+  const adultAge = petState.STAGE_AGE_MS.adult
+  const makeTeen = (avgCare) => ({
+    ...petState.createPet(T0), stage: 'teen', ageMs: adultAge, careSum: avgCare * adultAge, adultForm: null,
+  })
+  const radiant = petState.updateStage(makeTeen(80))
+  assert.strictEqual(radiant.stage, 'adult')
+  assert.strictEqual(radiant.adultForm, 'radiant')
+  assert.strictEqual(petState.updateStage(makeTeen(70)).adultForm, 'radiant', 'exactly at the radiant threshold')
+
+  const steady = petState.updateStage(makeTeen(55))
+  assert.strictEqual(steady.adultForm, 'steady')
+  assert.strictEqual(petState.updateStage(makeTeen(40)).adultForm, 'steady', 'exactly at the steady threshold')
+
+  const scruffy = petState.updateStage(makeTeen(10))
+  assert.strictEqual(scruffy.adultForm, 'scruffy')
+  assert.strictEqual(petState.updateStage(makeTeen(0)).adultForm, 'scruffy', 'exactly at the scruffy threshold')
+})
+
+test('sick time is capped at SICK_CARE_CAP when accumulating careSum', () => {
+  const sickPet = { ...petState.createPet(T0), fullness: 90, energy: 90, fun: 90, sick: true }
+  const next = petState.applyDecay(sickPet, T0 + MIN)
+  // Both the before/after samples get capped at SICK_CARE_CAP since sick === true, and stats stay
+  // well above that cap over one minute, so the trapezoid average is exactly the cap.
+  assert.strictEqual(next.careSum, petState.SICK_CARE_CAP * MIN)
+})
+
+test('adultForm stays locked once set, even after later neglect drags the average down', () => {
+  const adultAge = petState.STAGE_AGE_MS.adult
+  const atTransition = petState.updateStage({
+    ...petState.createPet(T0), stage: 'teen', ageMs: adultAge, careSum: 80 * adultAge, adultForm: null,
+  })
+  assert.strictEqual(atTransition.stage, 'adult')
+  assert.strictEqual(atTransition.adultForm, 'radiant')
+
+  // Neglect for a long stretch afterwards (careSum barely grows -> average care crashes).
+  // updateStage must leave adultForm alone because it was already set once.
+  const neglected = petState.updateStage({
+    ...atTransition, ageMs: atTransition.ageMs + 10000, careSum: atTransition.careSum,
+  })
+  assert.strictEqual(neglected.stage, 'adult')
+  assert.strictEqual(neglected.adultForm, 'radiant', 'adultForm must not be recomputed once locked')
+})
+
+test('deserialize migrates an old v1 save with no evolution fields at all', () => {
+  const raw = JSON.stringify({
+    version: 1,
+    pet: { fullness: 33, energy: 44, fun: 55, updatedAt: T0, lastActionAt: { feed: 1, play: 2, rest: 3 } },
+  })
+  const result = petState.deserialize(raw, T0 + 999)
+  assert.strictEqual(result.fullness, 33)
+  assert.strictEqual(result.energy, 44)
+  assert.strictEqual(result.fun, 55)
+  assert.strictEqual(result.ageMs, 0)
+  assert.strictEqual(result.careSum, 0)
+  assert.strictEqual(result.stage, 'egg')
+  assert.strictEqual(result.adultForm, null)
+})
+
+test('deserialize coerces garbage evolution fields without a full reset', () => {
+  const raw = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 60, energy: 61, fun: 62, updatedAt: T0,
+      lastActionAt: { feed: 0, play: 0, rest: 0 },
+      ageMs: 'lots', careSum: -5, stage: 'larva', adultForm: 'golden',
+    },
+  })
+  const result = petState.deserialize(raw, T0 + 1)
+  assert.strictEqual(result.fullness, 60, 'garbage evolution fields must not trigger a full reset')
+  assert.strictEqual(result.energy, 61)
+  assert.strictEqual(result.fun, 62)
+  assert.strictEqual(result.ageMs, 0)
+  assert.strictEqual(result.careSum, 0)
+  assert.strictEqual(result.stage, 'egg')
+  assert.strictEqual(result.adultForm, null)
+})
+
+test('deserialize reconciles an inconsistent stage/ageMs/adultForm combination', () => {
+  // Stage claims "adult" already even though ageMs is still in egg territory (e.g. a corrupted or
+  // hand-edited save). updateStage never regresses stage, so it stays adult; since adultForm was
+  // never set, it gets computed now from whatever care average the (low) ageMs/careSum imply.
+  const raw = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 50, energy: 50, fun: 50, updatedAt: T0,
+      lastActionAt: { feed: 0, play: 0, rest: 0 },
+      ageMs: 1000, careSum: 50 * 1000,
+      stage: 'adult', adultForm: null,
+    },
+  })
+  const result = petState.deserialize(raw, T0 + 1)
+  assert.strictEqual(result.stage, 'adult', 'stage must never regress, even reconciling a stale/low ageMs')
+  assert.strictEqual(result.adultForm, 'steady', 'adultForm must be computed once stage is adult and was unset')
+})
+
+test('deserialize drops a pre-set adultForm on a pet that is not adult yet', () => {
+  const raw = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 10, energy: 10, fun: 10, updatedAt: T0,
+      lastActionAt: { feed: 0, play: 0, rest: 0 },
+      ageMs: 1000, careSum: 10 * 1000,
+      stage: 'egg', adultForm: 'radiant',
+    },
+  })
+  const result = petState.deserialize(raw, T0 + 1)
+  assert.strictEqual(result.stage, 'egg')
+  assert.strictEqual(result.adultForm, null, 'a non-adult must not carry a locked-in form')
+})
+
+test('new evolution fields survive a serialize -> deserialize round trip', () => {
+  const pet = {
+    ...petState.createPet(T0),
+    updatedAt: T0 + 700000,
+    ageMs: 700000, careSum: 42 * 700000, stage: 'child', adultForm: null,
+  }
+  assert.deepStrictEqual(petState.deserialize(petState.serialize(pet), T0), pet)
+})
+
+test('careSum clamp during deserialize caps an impossibly large garbage value', () => {
+  const raw = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 50, energy: 50, fun: 50, updatedAt: T0,
+      lastActionAt: { feed: 0, play: 0, rest: 0 },
+      ageMs: 1000, careSum: 999999999, stage: 'egg', adultForm: null,
+    },
+  })
+  const result = petState.deserialize(raw, T0 + 1)
+  assert.ok(result.careSum <= 1000 * petState.STAT_MAX, 'careSum must be clamped to ageMs * STAT_MAX')
+})
+
 test('applyDecay and applyAction do not mutate their input', () => {
   const pet = petState.createPet(T0)
   const snapshot = JSON.stringify(pet)
   petState.applyDecay(pet, T0 + MIN)
   petState.applyAction(pet, 'feed', T0 + MIN)
+  petState.updateStage(pet)
+  petState.getStageInfo(pet)
+  petState.getAverageCare(pet)
   assert.strictEqual(JSON.stringify(pet), snapshot)
 })
 
@@ -264,9 +477,12 @@ test('deserialize coerces garbage sick/zeroSince values without a full reset', (
 })
 
 test('serialize -> deserialize round-trips sick:true and a non-null zeroSince exactly', () => {
+  // Evolution fields added for the Egg->Adult feature: this pet never ran through applyDecay, so
+  // it carries the same ageMs:0/careSum:0/stage:'egg'/adultForm:null defaults createPet would give it.
   const pet = {
     fullness: 20, energy: 60, fun: 80, updatedAt: T0 + 50000,
     lastActionAt: { feed: 0, play: 0, rest: 0 }, zeroSince: T0 + 12345, sick: true,
+    ageMs: 0, careSum: 0, stage: 'egg', adultForm: null,
   }
   assert.deepStrictEqual(petState.deserialize(petState.serialize(pet), T0), pet)
 })
