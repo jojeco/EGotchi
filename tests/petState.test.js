@@ -4,6 +4,7 @@ const fs = require('fs')
 const path = require('path')
 const petState = require('../game/petState')
 const storage = require('../game/storage')
+const achievements = require('../game/achievements')
 
 const MIN = 60000
 const T0 = 1700000000000
@@ -13,7 +14,7 @@ const test = (name, fn) => tests.push({ name, fn })
 test('petState exports every symbol App.js and storage.js rely on', () => {
   const names = ['STAT_MIN', 'STAT_MAX', 'MOOD_COUNT', 'MAX_OFFLINE_MS', 'SAVE_VERSION', 'STAT_KEYS',
     'DECAY_PER_MINUTE', 'ACTIONS', 'SICK_AFTER_MS', 'RECOVER_THRESHOLD', 'SICK_MOOD_CAP',
-    'STAGES', 'STAGE_AGE_MS', 'ADULT_FORMS', 'SICK_CARE_CAP', 'clampStat',
+    'STAGES', 'STAGE_AGE_MS', 'ADULT_FORMS', 'SICK_CARE_CAP', 'HISTORY_KEYS', 'coerceHistory', 'clampStat',
     'createPet', 'updateHealth', 'updateStage', 'applyDecay', 'getCooldownRemaining', 'canDoAction',
     'applyAction', 'getAverage', 'getAverageCare', 'getStageInfo', 'getMoodIndex', 'isSick',
     'serialize', 'deserialize']
@@ -299,15 +300,20 @@ test('careSum clamp during deserialize caps an impossibly large garbage value', 
   assert.ok(result.careSum <= 1000 * petState.STAT_MAX, 'careSum must be clamped to ageMs * STAT_MAX')
 })
 
-test('applyDecay and applyAction do not mutate their input', () => {
+test('applyDecay and applyAction do not mutate their input, including history/achievements', () => {
   const pet = petState.createPet(T0)
+  const historySnapshot = JSON.stringify(pet.history)
+  const achievementsSnapshot = JSON.stringify(pet.achievements)
   const snapshot = JSON.stringify(pet)
   petState.applyDecay(pet, T0 + MIN)
   petState.applyAction(pet, 'feed', T0 + MIN)
   petState.updateStage(pet)
   petState.getStageInfo(pet)
   petState.getAverageCare(pet)
+  petState.updateHealth(pet, T0 + MIN)
   assert.strictEqual(JSON.stringify(pet), snapshot)
+  assert.strictEqual(JSON.stringify(pet.history), historySnapshot, 'history must not be mutated in place')
+  assert.strictEqual(JSON.stringify(pet.achievements), achievementsSnapshot, 'achievements must not be mutated in place')
 })
 
 test('each action applies its effects (after decay), clamped', () => {
@@ -479,10 +485,13 @@ test('deserialize coerces garbage sick/zeroSince values without a full reset', (
 test('serialize -> deserialize round-trips sick:true and a non-null zeroSince exactly', () => {
   // Evolution fields added for the Egg->Adult feature: this pet never ran through applyDecay, so
   // it carries the same ageMs:0/careSum:0/stage:'egg'/adultForm:null defaults createPet would give it.
+  // Same story for history/achievements, added for the milestones feature: zeroed/empty defaults.
   const pet = {
     fullness: 20, energy: 60, fun: 80, updatedAt: T0 + 50000,
     lastActionAt: { feed: 0, play: 0, rest: 0 }, zeroSince: T0 + 12345, sick: true,
     ageMs: 0, careSum: 0, stage: 'egg', adultForm: null,
+    history: { feeds: 0, plays: 0, rests: 0, timesSick: 0, recoveries: 0, careStreakMs: 0, bestCareStreakMs: 0 },
+    achievements: {},
   }
   assert.deepStrictEqual(petState.deserialize(petState.serialize(pet), T0), pet)
 })
@@ -566,6 +575,266 @@ test('createLocalStorageAdapter with a throwing localStorage never crashes load/
   await assert.rejects(adapter.getItem('x'))
   assert.deepStrictEqual(await storage.savePet(adapter, petState.createPet(T0), petState), { ok: false })
   assert.deepStrictEqual(await storage.loadPet(adapter, T0, petState), petState.createPet(T0))
+})
+
+// --- Achievements/milestones: history tracking on petState -----------------------------------
+
+test('deserialize migrates an old save with no history/achievements fields at all', () => {
+  const raw = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 33, energy: 44, fun: 55, updatedAt: T0,
+      lastActionAt: { feed: 1, play: 2, rest: 3 },
+      ageMs: 123456, careSum: 50 * 123456, stage: 'child', adultForm: null,
+    },
+  })
+  const result = petState.deserialize(raw, T0 + 999)
+  assert.strictEqual(result.fullness, 33, 'migration must not reset existing stats')
+  assert.strictEqual(result.stage, 'child')
+  assert.strictEqual(result.ageMs, 123456)
+  assert.strictEqual(result.adultForm, null)
+  assert.deepStrictEqual(result.history,
+    { feeds: 0, plays: 0, rests: 0, timesSick: 0, recoveries: 0, careStreakMs: 0, bestCareStreakMs: 0 })
+  assert.deepStrictEqual(result.achievements, {})
+})
+
+test('deserialize coerces garbage history values per-field without a full reset', () => {
+  const raw = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 60, energy: 61, fun: 62, updatedAt: T0,
+      lastActionAt: { feed: 0, play: 0, rest: 0 },
+      history: {
+        feeds: 'lots', plays: NaN, rests: -5, timesSick: [1, 2], recoveries: null,
+        careStreakMs: 'x', bestCareStreakMs: -1,
+      },
+    },
+  })
+  const result = petState.deserialize(raw, T0 + 1)
+  assert.strictEqual(result.fullness, 60, 'garbage history must not trigger a full reset')
+  assert.strictEqual(result.stage, 'egg')
+  assert.deepStrictEqual(result.history,
+    { feeds: 0, plays: 0, rests: 0, timesSick: 0, recoveries: 0, careStreakMs: 0, bestCareStreakMs: 0 })
+})
+
+test('coerceHistory coerces each field independently, including array/null/undefined input', () => {
+  const zero = { feeds: 0, plays: 0, rests: 0, timesSick: 0, recoveries: 0, careStreakMs: 0, bestCareStreakMs: 0 }
+  assert.deepStrictEqual(petState.coerceHistory(null), zero)
+  assert.deepStrictEqual(petState.coerceHistory(undefined), zero)
+  assert.deepStrictEqual(petState.coerceHistory([1, 2, 3]), zero)
+  assert.deepStrictEqual(petState.coerceHistory({ feeds: 5, plays: 'nope', rests: -3 }), { ...zero, feeds: 5 })
+  for (const k of petState.HISTORY_KEYS) assert.ok(Object.prototype.hasOwnProperty.call(zero, k))
+})
+
+test('deserialize filters garbage achievement entries but keeps good ones, including unknown ids', () => {
+  const raw = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 50, energy: 50, fun: 50, updatedAt: T0,
+      lastActionAt: { feed: 0, play: 0, rest: 0 },
+      achievements: { first_meal: T0, bogus: 'not a number', some_future_id: T0 + 1, broken: NaN },
+    },
+  })
+  const result = petState.deserialize(raw, T0 + 1)
+  assert.deepStrictEqual(result.achievements, { first_meal: T0, some_future_id: T0 + 1 })
+})
+
+test('deserialize treats a non-object/array achievements value as empty', () => {
+  const raw = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 50, energy: 50, fun: 50, updatedAt: T0,
+      lastActionAt: { feed: 0, play: 0, rest: 0 },
+      achievements: ['first_meal'],
+    },
+  })
+  const result = petState.deserialize(raw, T0 + 1)
+  assert.deepStrictEqual(result.achievements, {})
+})
+
+test('history and achievements survive a full serialize/deserialize round trip', () => {
+  const pet = {
+    ...petState.createPet(T0),
+    history: { feeds: 3, plays: 1, rests: 2, timesSick: 1, recoveries: 1, careStreakMs: 5000, bestCareStreakMs: 9000 },
+    achievements: { first_meal: T0, comeback: T0 + 500 },
+  }
+  assert.deepStrictEqual(petState.deserialize(petState.serialize(pet), T0 + 10), pet)
+})
+
+test('loadPet/savePet round-trips history and achievements through createMemoryStorage', async () => {
+  const store = storage.createMemoryStorage()
+  let pet = petState.applyAction(petState.createPet(T0), 'feed', T0).pet
+  pet = { ...pet, achievements: { first_meal: T0 } }
+  assert.deepStrictEqual(await storage.savePet(store, pet, petState), { ok: true })
+  assert.deepStrictEqual(await storage.loadPet(store, T0 + 1, petState), pet)
+})
+
+test('each action increments only its own history counter', () => {
+  for (const id of Object.keys(petState.ACTIONS)) {
+    const res = petState.applyAction(petState.createPet(T0), id, T0)
+    assert.strictEqual(res.applied, true)
+    const key = { feed: 'feeds', play: 'plays', rest: 'rests' }[id]
+    for (const k of ['feeds', 'plays', 'rests']) {
+      assert.strictEqual(res.pet.history[k], k === key ? 1 : 0, id + ' must only bump ' + key)
+    }
+  }
+})
+
+test('a cooldown-blocked action leaves history counters (and the pet) untouched', () => {
+  const first = petState.applyAction(petState.createPet(T0), 'feed', T0)
+  assert.strictEqual(first.pet.history.feeds, 1)
+  const blocked = petState.applyAction(first.pet, 'feed', T0 + 1000)
+  assert.strictEqual(blocked.applied, false)
+  assert.strictEqual(blocked.pet, first.pet, 'a blocked action must return the exact same pet, untouched')
+  assert.strictEqual(blocked.pet.history.feeds, 1)
+})
+
+test('timesSick increments exactly once across the decay-phase and action-phase updateHealth calls', () => {
+  const pet = {
+    fullness: 0, energy: 100, fun: 100, updatedAt: T0,
+    lastActionAt: { feed: 0, play: 0, rest: 0 },
+    zeroSince: T0 - petState.SICK_AFTER_MS, sick: false,
+    history: { feeds: 0, plays: 0, rests: 0, timesSick: 0, recoveries: 0, careStreakMs: 0, bestCareStreakMs: 0 },
+    achievements: {}, ageMs: 0, careSum: 0, stage: 'egg', adultForm: null,
+  }
+  // The decay-phase updateHealth call (inside applyDecay) is what flips sick false->true here,
+  // since zeroSince is already SICK_AFTER_MS in the past; the action-phase call right after must
+  // not count it again even though it also runs updateHealth.
+  const res = petState.applyAction(pet, 'feed', T0)
+  assert.strictEqual(res.applied, true)
+  assert.strictEqual(res.pet.sick, true)
+  assert.strictEqual(res.pet.history.timesSick, 1, 'exactly one sick transition, not double-counted')
+})
+
+test('recoveries increments exactly once when an action brings every stat back up to RECOVER_THRESHOLD', () => {
+  const pet = {
+    fullness: 39, energy: 50, fun: 50, updatedAt: T0,
+    lastActionAt: { feed: 0, play: 0, rest: 0 }, zeroSince: null, sick: true,
+    history: { feeds: 0, plays: 0, rests: 0, timesSick: 0, recoveries: 0, careStreakMs: 0, bestCareStreakMs: 0 },
+    achievements: {}, ageMs: 0, careSum: 0, stage: 'egg', adultForm: null,
+  }
+  const res = petState.applyAction(pet, 'feed', T0)
+  assert.strictEqual(res.applied, true)
+  assert.strictEqual(res.pet.sick, false, 'feed must have lifted fullness to >= RECOVER_THRESHOLD')
+  assert.strictEqual(res.pet.history.recoveries, 1)
+  assert.strictEqual(res.pet.history.timesSick, 0)
+})
+
+test('care streak grows while every stat stays healthy, and resets the instant any stat hits zero', () => {
+  const healthy = petState.createPet(T0)
+  const afterOneMinute = petState.applyDecay(healthy, T0 + MIN)
+  assert.strictEqual(afterOneMinute.zeroSince, null)
+  assert.strictEqual(afterOneMinute.history.careStreakMs, MIN)
+  assert.strictEqual(afterOneMinute.history.bestCareStreakMs, MIN)
+
+  const afterTwoMinutes = petState.applyDecay(afterOneMinute, T0 + 2 * MIN)
+  assert.strictEqual(afterTwoMinutes.history.careStreakMs, 2 * MIN)
+  assert.strictEqual(afterTwoMinutes.history.bestCareStreakMs, 2 * MIN)
+
+  // Fullness decays 6/min from 70, so it hits zero well before the 12-minute mark.
+  const afterZeroed = petState.applyDecay(afterTwoMinutes, T0 + 12 * MIN)
+  assert.strictEqual(afterZeroed.fullness, petState.STAT_MIN)
+  assert.strictEqual(afterZeroed.history.careStreakMs, 0, 'hitting zero must reset the current streak')
+  assert.strictEqual(afterZeroed.history.bestCareStreakMs, 2 * MIN, 'the best streak must be kept, not reset')
+})
+
+test('bestCareStreakMs keeps the max across a reset-then-regrow cycle', () => {
+  let pet = petState.createPet(T0)
+  pet = petState.applyDecay(pet, T0 + 3 * MIN) // still fully healthy, streak = 3min
+  assert.strictEqual(pet.history.careStreakMs, 3 * MIN)
+  pet = petState.applyDecay(pet, T0 + 12 * MIN) // fullness hits 0, streak resets
+  assert.strictEqual(pet.history.careStreakMs, 0)
+  assert.strictEqual(pet.history.bestCareStreakMs, 3 * MIN)
+  const fed = petState.applyAction(pet, 'feed', T0 + 12 * MIN).pet
+  const later = petState.applyDecay(fed, T0 + 13 * MIN)
+  assert.strictEqual(later.history.bestCareStreakMs, 3 * MIN, 'a new, shorter streak must not beat the old best')
+})
+
+test('a 30-day offline gap leaves history identical to the 12h MAX_OFFLINE_MS cap', () => {
+  // Seed a prior bestCareStreakMs first: by the 12h/30-day mark a fresh pet's fullness has long
+  // since hit zero, so the *current* streak is 0 either way — the cap is proven on the best streak
+  // (which both runs must agree carried over unchanged) instead.
+  const base = petState.applyDecay(petState.createPet(T0), T0 + 5 * MIN)
+  assert.strictEqual(base.history.bestCareStreakMs, 5 * MIN)
+  const long = petState.applyDecay(base, T0 + 30 * 24 * 3600e3)
+  const capped = petState.applyDecay(base, T0 + petState.MAX_OFFLINE_MS)
+  assert.deepStrictEqual(long.history, capped.history)
+  assert.strictEqual(long.history.careStreakMs, 0)
+  assert.strictEqual(long.history.bestCareStreakMs, 5 * MIN)
+})
+
+// --- game/achievements.js -----------------------------------------------------------------------
+
+test('achievements.STAGE_ORDER matches petState.STAGES exactly', () => {
+  assert.deepStrictEqual(achievements.STAGE_ORDER, petState.STAGES)
+})
+
+test('achievements.ACHIEVEMENTS has unique ids', () => {
+  const ids = achievements.ACHIEVEMENTS.map(a => a.id)
+  assert.strictEqual(new Set(ids).size, ids.length)
+})
+
+test('evaluateAchievements unlocks first_meal after a single feed, and is idempotent', () => {
+  const fed = petState.applyAction(petState.createPet(T0), 'feed', T0).pet
+  const first = achievements.evaluateAchievements(fed, T0 + 1)
+  assert.ok(first.newlyUnlocked.includes('first_meal'))
+  assert.strictEqual(first.pet.achievements.first_meal, T0 + 1)
+
+  const second = achievements.evaluateAchievements(first.pet, T0 + 2)
+  assert.deepStrictEqual(second.newlyUnlocked, [])
+  assert.strictEqual(second.pet, first.pet, 'nothing new unlocked must return the same pet reference')
+})
+
+test('evaluateAchievements never removes or re-timestamps an existing unlock', () => {
+  const fed = petState.applyAction(petState.createPet(T0), 'feed', T0).pet
+  const unlocked = achievements.evaluateAchievements(fed, T0 + 1).pet
+  // Pretend the pet regressed (e.g. a tampered save with feeds reset to 0); the unlock must stick.
+  const regressed = { ...unlocked, history: { ...unlocked.history, feeds: 0 } }
+  const result = achievements.evaluateAchievements(regressed, T0 + 5000)
+  assert.strictEqual(result.pet.achievements.first_meal, T0 + 1, 'unlock timestamp must not change')
+  assert.ok(Object.prototype.hasOwnProperty.call(result.pet.achievements, 'first_meal'))
+})
+
+test('an old save that migrates straight to adult unlocks both hatched and grown_up', () => {
+  const raw = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 80, energy: 80, fun: 80, updatedAt: T0,
+      lastActionAt: { feed: 0, play: 0, rest: 0 },
+      ageMs: petState.STAGE_AGE_MS.adult, careSum: 50 * petState.STAGE_AGE_MS.adult,
+      stage: 'adult', adultForm: 'steady',
+    },
+  })
+  const pet = petState.deserialize(raw, T0 + 1)
+  assert.strictEqual(pet.stage, 'adult')
+  const result = achievements.evaluateAchievements(pet, T0 + 2)
+  assert.ok(result.newlyUnlocked.includes('hatched'))
+  assert.ok(result.newlyUnlocked.includes('grown_up'))
+})
+
+test('getProgress ignores unknown achievement ids; getAchievementList preserves known-id state', () => {
+  const pet = { ...petState.createPet(T0), achievements: { first_meal: T0, some_future_achievement: T0 } }
+  const progress = achievements.getProgress(pet)
+  assert.strictEqual(progress.unlocked, 1, 'an unknown id must not inflate the unlocked count')
+  assert.strictEqual(progress.total, achievements.ACHIEVEMENTS.length)
+  const list = achievements.getAchievementList(pet)
+  const firstMealRow = list.find(r => r.id === 'first_meal')
+  assert.strictEqual(firstMealRow.unlocked, true)
+  assert.strictEqual(firstMealRow.unlockedAt, T0)
+  assert.ok(!list.some(r => r.id === 'some_future_achievement'), 'unknown ids are not rendered as rows')
+})
+
+test('an unknown achievement id is ignored for display but preserved through a round trip', () => {
+  const pet = { ...petState.createPet(T0), achievements: { first_meal: T0, some_future_achievement: T0 + 1 } }
+  const reloaded = petState.deserialize(petState.serialize(pet), T0 + 5)
+  assert.deepStrictEqual(reloaded.achievements, { first_meal: T0, some_future_achievement: T0 + 1 })
+  assert.strictEqual(achievements.getProgress(reloaded).unlocked, 1)
+})
+
+test('App.js renders AchievementsPanel and calls evaluateAchievements', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'App.js'), 'utf8')
+  assert.ok(/<AchievementsPanel\b/.test(src), 'App.js must render <AchievementsPanel>')
+  assert.ok(/evaluateAchievements/.test(src), 'App.js must call evaluateAchievements')
 })
 
 async function run() {

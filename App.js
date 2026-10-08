@@ -6,12 +6,15 @@ import StatBar from './Components/StatBar';
 import ActionButtons from './Components/ActionButtons';
 import SickBanner from './Components/SickBanner';
 import StageBadge from './Components/StageBadge';
+import AchievementsPanel from './Components/AchievementsPanel';
 import petState from './game/petState';
 import storage from './game/storage';
+import achievements from './game/achievements';
 
 const TICK_INTERVAL_MS = 1000;
 const SAVE_INTERVAL_MS = 10000;
 const EVOLVE_BANNER_MS = 3000;
+const ACHIEVEMENT_TOAST_MS = 3000;
 
 // Real persistence on Expo web (localStorage); native falls back to memory until a backend is wired.
 const getLocalStorage = () => {
@@ -33,9 +36,11 @@ export default function App() {
   const [ready, setReady] = useState(false)
   const [now, setNow] = useState(() => Date.now())
   const [justEvolved, setJustEvolved] = useState(false)
+  const [achievementToast, setAchievementToast] = useState(null)
   const petRef = useRef(pet)
   const stageIndexRef = useRef(0)
   const evolveTimeoutRef = useRef(null)
+  const achievementToastTimeoutRef = useRef(null)
 
   // Fires the "Evolved!" banner whenever a tick/action pushes the stage index forward, and
   // clears it again after EVOLVE_BANNER_MS. Guarded by stageIndexRef so the initial load (seeded
@@ -50,8 +55,31 @@ export default function App() {
     stageIndexRef.current = index
   }
 
+  // Runs evaluateAchievements on `current`, updates petRef, and (unless `silent`) fires an
+  // "Unlocked!" toast cleared after ACHIEVEMENT_TOAST_MS, mirroring noteStage/evolveTimeoutRef
+  // above. `silent` is used on initial load so an old save backfilling several unlocks at once
+  // doesn't spam toasts. Returns the evaluated pet so callers can save/render it.
+  const noteAchievements = (current, atTime, silent) => {
+    const result = achievements.evaluateAchievements(current, atTime)
+    petRef.current = result.pet
+    if (!silent && result.newlyUnlocked.length > 0) {
+      const labels = result.newlyUnlocked
+        .map(id => achievements.ACHIEVEMENTS.find(a => a.id === id))
+        .filter(Boolean)
+        .map(a => a.label)
+        .join(', ')
+      setAchievementToast(labels)
+      if (achievementToastTimeoutRef.current) clearTimeout(achievementToastTimeoutRef.current)
+      achievementToastTimeoutRef.current = setTimeout(() => setAchievementToast(null), ACHIEVEMENT_TOAST_MS)
+    }
+    return result.pet
+  }
+
   useEffect(() => {
-    return () => { if (evolveTimeoutRef.current) clearTimeout(evolveTimeoutRef.current) }
+    return () => {
+      if (evolveTimeoutRef.current) clearTimeout(evolveTimeoutRef.current)
+      if (achievementToastTimeoutRef.current) clearTimeout(achievementToastTimeoutRef.current)
+    }
   }, [])
 
   useEffect(() => {
@@ -63,6 +91,9 @@ export default function App() {
       // Seed from the loaded pet's stage (not the throwaway fresh pet's), so a save that's
       // already past Egg doesn't fire a bogus evolution banner on first render.
       stageIndexRef.current = petState.getStageInfo(petRef.current).index
+      // Silent: an old save may already satisfy several achievements that didn't exist yet when
+      // it was written, and those shouldn't all fire toasts the instant the app opens.
+      noteAchievements(petRef.current, current, true)
       setPet(petRef.current)
       setNow(current)
       setReady(true)
@@ -76,6 +107,7 @@ export default function App() {
       const current = Date.now()
       petRef.current = petState.applyDecay(petRef.current, current)
       noteStage(petRef.current)
+      noteAchievements(petRef.current, current, false)
       setPet(petRef.current)
       setNow(current)
     }, TICK_INTERVAL_MS)
@@ -97,9 +129,10 @@ export default function App() {
     if (!result.applied) return
     petRef.current = result.pet
     noteStage(petRef.current)
-    setPet(result.pet)
+    const evaluated = noteAchievements(petRef.current, current, false)
+    setPet(evaluated)
     setNow(current)
-    storage.savePet(store, result.pet, petState)
+    storage.savePet(store, evaluated, petState)
   }
 
   const cooldowns = {}
@@ -108,6 +141,8 @@ export default function App() {
   }
 
   const stageInfo = petState.getStageInfo(pet)
+  const achievementList = achievements.getAchievementList(pet)
+  const achievementProgress = achievements.getProgress(pet)
 
   return (
     <View style={styles.container}>
@@ -121,6 +156,7 @@ export default function App() {
         <StatBar label='Fun' value={pet.fun} color='#e91e63'/>
       </View>
       <ActionButtons actions={ACTION_LIST} onPress={handleAction} cooldowns={cooldowns} disabled={!ready}/>
+      <AchievementsPanel list={achievementList} progress={achievementProgress} toast={achievementToast}/>
       <StatusBar style="auto" />
     </View>
   );

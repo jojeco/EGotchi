@@ -35,5 +35,14 @@
   tracks `zeroSince`/`sick` (with an exact offline zero-crossing timestamp, not just "now"), the
   pet goes Sick after 2 minutes at 0 and stays Sick until every stat is back up to 40, and a new
   `Components/SickBanner.js` shows it in `App.js`.
+- [x] No way to look back on how well a pet had been cared for, just the live stats. Done:
+  `game/petState.js` tracks a `history` of feed/play/rest counts, times-sick/recoveries and a
+  care streak (current and best), and `game/achievements.js` checks ~10 milestones against it
+  (first feed, 25 feeds/plays/rests, reaching Baby/Adult, the Radiant adult form, a recovery, a
+  30-minute unbroken care streak, and all three stats at 95+ at once).
+  `Components/AchievementsPanel.js` shows unlock progress and a brief toast in `App.js`, wired in
+  right alongside the existing stage-evolution banner.
+- An event/history log built on top of the `history` counters — a simple timestamped feed of
+  what the pet did and when, instead of just the running totals.
 - Add a small component/integration test (or at least a bundle check) for `App.js`; today
   only the pure `game/` modules are covered.

@@ -38,6 +38,25 @@ const ACTIONS = {
   rest: { id: 'rest', label: 'Rest', cooldownMs: 45000, effects: { fullness: -5, energy: 35, fun: -5 } },
 }
 const ACTION_IDS = Object.keys(ACTIONS)
+// Which history counter each action bumps, for applyAction.
+const ACTION_HISTORY_KEY = { feed: 'feeds', play: 'plays', rest: 'rests' }
+
+// History/achievements: counters + a care streak used by game/achievements.js to unlock
+// milestones. Kept on the pet itself (like every other stat) so they persist and migrate the
+// same way ageMs/careSum do.
+const HISTORY_KEYS = ['feeds', 'plays', 'rests', 'timesSick', 'recoveries', 'careStreakMs', 'bestCareStreakMs']
+
+// Pure: coerces a possibly-missing/garbage raw history blob into a fully-populated history
+// object, defaulting any missing or invalid (non-finite, negative, wrong type) field to 0
+// independently of the others, so one bad field never resets the rest.
+function coerceHistory(raw) {
+  const history = {}
+  for (const key of HISTORY_KEYS) {
+    const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw[key] : undefined
+    history[key] = (typeof value === 'number' && Number.isFinite(value) && value >= 0) ? value : 0
+  }
+  return history
+}
 
 function clampStat(n) {
   if (typeof n !== 'number' || !Number.isFinite(n)) return STAT_MIN
@@ -57,6 +76,8 @@ function createPet(now = Date.now()) {
     careSum: 0,
     stage: 'egg',
     adultForm: null,
+    history: { feeds: 0, plays: 0, rests: 0, timesSick: 0, recoveries: 0, careStreakMs: 0, bestCareStreakMs: 0 },
+    achievements: {},
   }
 }
 
@@ -68,7 +89,12 @@ function updateHealth(pet, now) {
   let zeroSince = anyZero ? (typeof pet.zeroSince === 'number' ? pet.zeroSince : now) : null
   let sick = pet.sick === true || (zeroSince !== null && now - zeroSince >= SICK_AFTER_MS)
   if (STAT_KEYS.every(k => pet[k] >= RECOVER_THRESHOLD)) sick = false
-  return { ...pet, zeroSince, sick }
+  // Coerced (not just copied) so a hand-built pet missing `history` still gets zeroed counters
+  // instead of poisoning them with NaN; real pets always already have a valid history object.
+  const history = coerceHistory(pet.history)
+  if (pet.sick !== true && sick === true) history.timesSick += 1
+  else if (pet.sick === true && sick === false) history.recoveries += 1
+  return { ...pet, zeroSince, sick, history }
 }
 
 // Pure: derives stage/adultForm from ageMs (and, once, the long-run care average). Stage never
@@ -116,7 +142,13 @@ function getStageInfo(pet) {
 
 function applyDecay(pet, now) {
   const elapsed = Math.min(Math.max(now - pet.updatedAt, 0), MAX_OFFLINE_MS)
-  const next = { ...pet, lastActionAt: { ...pet.lastActionAt }, updatedAt: now }
+  const next = {
+    ...pet,
+    lastActionAt: { ...pet.lastActionAt },
+    history: coerceHistory(pet.history),
+    achievements: { ...pet.achievements },
+    updatedAt: now,
+  }
   let earliestCrossing = null
   for (const k of STAT_KEYS) {
     const rate = DECAY_PER_MINUTE[k] / 60000
@@ -140,7 +172,14 @@ function applyDecay(pet, now) {
   const avgAfter = sickCapped ? Math.min(getAverage(next), SICK_CARE_CAP) : getAverage(next)
   next.ageMs = pet.ageMs + elapsed
   next.careSum = pet.careSum + ((avgBefore + avgAfter) / 2) * elapsed
-  return updateHealth(updateStage(next), now)
+  const healed = updateHealth(updateStage(next), now)
+  // Care streak: grows by this tick's (already-capped) elapsed time as long as the pet came out
+  // of this tick with no zeroed stat and not sick; any zero-crossing or sickness resets it. The
+  // best streak is a running max, so it survives later resets.
+  const stayedHealthy = healed.zeroSince === null && !healed.sick
+  const careStreakMs = stayedHealthy ? healed.history.careStreakMs + elapsed : 0
+  const bestCareStreakMs = Math.max(healed.history.bestCareStreakMs, careStreakMs)
+  return { ...healed, history: { ...healed.history, careStreakMs, bestCareStreakMs } }
 }
 
 function getCooldownRemaining(pet, actionId, now) {
@@ -165,7 +204,13 @@ function applyAction(pet, actionId, now) {
   if (!check.allowed) return { pet, applied: false, reason: check.reason }
   const action = ACTIONS[actionId]
   const decayed = applyDecay(pet, now)
-  const next = { ...decayed, lastActionAt: { ...decayed.lastActionAt } }
+  const historyKey = ACTION_HISTORY_KEY[actionId]
+  const next = {
+    ...decayed,
+    lastActionAt: { ...decayed.lastActionAt },
+    history: { ...decayed.history, [historyKey]: decayed.history[historyKey] + 1 },
+    achievements: { ...decayed.achievements },
+  }
   for (const k of STAT_KEYS) {
     next[k] = clampStat(next[k] + action.effects[k])
   }
@@ -217,6 +262,16 @@ function deserialize(raw, now = Date.now()) {
     const careSum = Math.min(careSumRaw, ageMs * STAT_MAX)
     const stage = STAGES.includes(p.stage) ? p.stage : 'egg'
     const adultForm = ADULT_FORMS.some(f => f.id === p.adultForm) ? p.adultForm : null
+    // Achievements: an id->timestamp map. Unknown ids (e.g. a newer save opened by an older
+    // build) are kept as-is; only entries with a non-finite/garbage timestamp are dropped, and a
+    // non-object/array value is treated as empty rather than resetting the whole pet.
+    const achievements = {}
+    if (p.achievements && typeof p.achievements === 'object' && !Array.isArray(p.achievements)) {
+      for (const id of Object.keys(p.achievements)) {
+        const t = p.achievements[id]
+        if (isFiniteNumber(t)) achievements[id] = t
+      }
+    }
     const pet = {
       fullness: clampStat(p.fullness),
       energy: clampStat(p.energy),
@@ -231,6 +286,8 @@ function deserialize(raw, now = Date.now()) {
       careSum,
       stage,
       adultForm,
+      history: coerceHistory(p.history),
+      achievements,
     }
     // Reconcile stage/adultForm against ageMs (handles inconsistent/tampered combinations the
     // same way a live pet's applyDecay would: stage never moves backwards, adultForm is only
@@ -257,6 +314,8 @@ module.exports = {
   STAGE_AGE_MS,
   ADULT_FORMS,
   SICK_CARE_CAP,
+  HISTORY_KEYS,
+  coerceHistory,
   clampStat,
   createPet,
   updateHealth,

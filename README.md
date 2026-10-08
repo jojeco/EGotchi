@@ -37,6 +37,19 @@ At the Teen → Adult transition the pet locks in one of three adult forms, base
 
 Once an adult form is set it's permanent — later neglect (or later great care) no longer changes it. Time spent sick counts for less: each care sample taken while the pet is sick is capped at 20, so riding out sickness doesn't inflate the long-run average. `Components/StageBadge.js` shows the current stage (plus form, once adult) and a countdown to the next stage, with a brief "Evolved!" highlight the moment a boundary is crossed.
 
+## Achievements
+
+The pet tracks a running `history` of care (feed/play/rest counts, times it's gotten sick,
+recoveries, and how long it's gone without any stat hitting zero). `game/achievements.js` checks
+that history against ~10 milestones: a first feed, 25 feeds/plays/rests, reaching the Baby and
+Adult stages, growing into the Radiant adult form, recovering from sickness, keeping every stat
+healthy for 30 minutes straight, and getting all three stats to 95+ at the same time.
+
+Achievements only ever unlock, never re-lock — once a milestone is hit its timestamp is permanent,
+even if the pet is neglected afterward. `Components/AchievementsPanel.js` shows a tappable
+"Achievements X/Y" summary that expands into the full list, and a brief "Unlocked: ...!" toast
+appears the moment a new one lands.
+
 ## Persistence
 
 The persistence layer is built and unit tested: `game/petState.js` serializes and deserializes the pet (versioned, falls back to a fresh pet on bad data), and `game/storage.js` provides `loadPet`/`savePet` on top of an injectable storage adapter (memory, localStorage, or an AsyncStorage-like module).
