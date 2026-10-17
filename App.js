@@ -1,6 +1,6 @@
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useRef, useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { AppState, StyleSheet, Text, View } from 'react-native';
 import Face, { FACE_LABELS } from './Components/Face';
 import StatBar from './Components/StatBar';
 import ActionButtons from './Components/ActionButtons';
@@ -117,7 +117,16 @@ export default function App() {
   useEffect(() => {
     if (!ready) return undefined
     const id = setInterval(() => storage.savePet(store, petRef.current, petState), SAVE_INTERVAL_MS)
-    return () => clearInterval(id)
+    const sub = AppState.addEventListener('change', (nextAppState) => {
+      if (nextAppState !== 'active') {
+        storage.savePet(store, petRef.current, petState)
+      }
+    })
+    return () => {
+      clearInterval(id)
+      sub.remove()
+      storage.savePet(store, petRef.current, petState)
+    }
   }, [ready])
 
   const handleAction = (id) => {

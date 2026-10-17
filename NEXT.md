@@ -46,3 +46,7 @@
   what the pet did and when, instead of just the running totals.
 - Add a small component/integration test (or at least a bundle check) for `App.js`; today
   only the pure `game/` modules are covered.
+- `App.js` now saves on an `AppState` background/inactive transition (in addition to the
+  interval and action saves), but on native that still writes through the in-memory store
+  from the persistence TODO above, so a true app kill after backgrounding still loses state;
+  wiring the AsyncStorage adapter would close that gap.
