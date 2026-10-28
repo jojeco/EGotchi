@@ -5,6 +5,7 @@ const path = require('path')
 const petState = require('../game/petState')
 const storage = require('../game/storage')
 const achievements = require('../game/achievements')
+const eventLog = require('../game/eventLog')
 
 const MIN = 60000
 const T0 = 1700000000000
@@ -485,13 +486,15 @@ test('deserialize coerces garbage sick/zeroSince values without a full reset', (
 test('serialize -> deserialize round-trips sick:true and a non-null zeroSince exactly', () => {
   // Evolution fields added for the Egg->Adult feature: this pet never ran through applyDecay, so
   // it carries the same ageMs:0/careSum:0/stage:'egg'/adultForm:null defaults createPet would give it.
-  // Same story for history/achievements, added for the milestones feature: zeroed/empty defaults.
+  // Same story for history/achievements (milestones feature) and events (activity log feature):
+  // zeroed/empty defaults.
   const pet = {
     fullness: 20, energy: 60, fun: 80, updatedAt: T0 + 50000,
     lastActionAt: { feed: 0, play: 0, rest: 0 }, zeroSince: T0 + 12345, sick: true,
     ageMs: 0, careSum: 0, stage: 'egg', adultForm: null,
     history: { feeds: 0, plays: 0, rests: 0, timesSick: 0, recoveries: 0, careStreakMs: 0, bestCareStreakMs: 0 },
     achievements: {},
+    events: [],
   }
   assert.deepStrictEqual(petState.deserialize(petState.serialize(pet), T0), pet)
 })
@@ -835,6 +838,208 @@ test('App.js renders AchievementsPanel and calls evaluateAchievements', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'App.js'), 'utf8')
   assert.ok(/<AchievementsPanel\b/.test(src), 'App.js must render <AchievementsPanel>')
   assert.ok(/evaluateAchievements/.test(src), 'App.js must call evaluateAchievements')
+})
+
+test('eventLog exports every symbol App.js and EventLogPanel.js rely on', () => {
+  const names = ['MAX_EVENTS', 'EVENT_TYPES', 'diffEvents', 'appendEvents', 'recordTransition',
+    'coerceEvents', 'describeEvent', 'formatAgo', 'getRecentEvents']
+  for (const n of names) assert.notStrictEqual(eventLog[n], undefined, 'eventLog missing ' + n)
+  assert.strictEqual(eventLog.MAX_EVENTS, 50)
+})
+
+test('recordTransition adds exactly one feed/play/rest event, with at === now', () => {
+  for (const id of Object.keys(petState.ACTIONS)) {
+    const prev = petState.createPet(T0)
+    const result = petState.applyAction(prev, id, T0)
+    assert.strictEqual(result.applied, true)
+    const recorded = eventLog.recordTransition(prev, result.pet, T0)
+    assert.deepStrictEqual(recorded.events, [{ type: id, at: T0 }])
+  }
+})
+
+test('a blocked action adds no event, and recordTransition returns the same reference', () => {
+  const first = petState.applyAction(petState.createPet(T0), 'feed', T0)
+  const blocked = petState.applyAction(first.pet, 'feed', T0 + 5000)
+  assert.strictEqual(blocked.applied, false)
+  const recorded = eventLog.recordTransition(first.pet, blocked.pet, T0 + 5000)
+  assert.strictEqual(recorded, blocked.pet, 'nothing changed, so the exact same pet reference comes back')
+})
+
+test('decay that makes the pet sick logs one sick event; recovering logs one recovered event', () => {
+  const base = {
+    fullness: 6, energy: 100, fun: 100, updatedAt: T0,
+    lastActionAt: { feed: 0, play: 0, rest: 0 }, zeroSince: null, sick: false,
+  }
+  const afterAt = T0 + 180000 + 5000
+  const sickened = petState.applyDecay(base, afterAt)
+  assert.strictEqual(sickened.sick, true)
+  assert.deepStrictEqual(eventLog.diffEvents(base, sickened, afterAt), [{ type: 'sick', at: afterAt }])
+
+  const prevSick = { ...petState.createPet(T0), sick: true, fullness: 39, energy: 39, fun: 39 }
+  const recovered = petState.updateHealth({ ...prevSick, fullness: 40, energy: 40, fun: 40 }, T0 + 1000)
+  assert.strictEqual(recovered.sick, false)
+  assert.deepStrictEqual(eventLog.diffEvents(prevSick, recovered, T0 + 1000), [{ type: 'recovered', at: T0 + 1000 }])
+})
+
+test('crossing Egg->Baby logs evolved with detail.stage; reaching Adult sets detail.adultForm', () => {
+  const base = petState.createPet(T0)
+  const boundary = petState.STAGE_AGE_MS.baby
+  const toBaby = petState.applyDecay(base, T0 + boundary)
+  assert.strictEqual(toBaby.stage, 'baby')
+  assert.deepStrictEqual(eventLog.diffEvents(base, toBaby, T0 + boundary),
+    [{ type: 'evolved', at: T0 + boundary, detail: { stage: 'baby', adultForm: null } }])
+
+  const adultAge = petState.STAGE_AGE_MS.adult
+  const teen = { ...petState.createPet(T0), stage: 'teen', ageMs: adultAge, careSum: 80 * adultAge, adultForm: null }
+  const adult = petState.updateStage(teen)
+  assert.strictEqual(adult.stage, 'adult')
+  assert.strictEqual(adult.adultForm, 'radiant')
+  assert.deepStrictEqual(eventLog.diffEvents(teen, adult, T0 + adultAge),
+    [{ type: 'evolved', at: T0 + adultAge, detail: { stage: 'adult', adultForm: 'radiant' } }])
+})
+
+test('a new achievement unlock logs an achievement event at its stored unlock timestamp; re-evaluating does not duplicate', () => {
+  const prev = petState.createPet(T0)
+  const fed = petState.applyAction(prev, 'feed', T0).pet
+  const result = achievements.evaluateAchievements(fed, T0 + 500)
+  assert.ok(result.newlyUnlocked.includes('first_meal'))
+  const events = eventLog.diffEvents(fed, result.pet, T0 + 999)
+  assert.deepStrictEqual(events, [{ type: 'achievement', at: T0 + 500, detail: { id: 'first_meal' } }])
+  // Re-evaluating against the same pet unlocks nothing new, so no duplicate event.
+  const again = achievements.evaluateAchievements(result.pet, T0 + 1500)
+  assert.strictEqual(again.newlyUnlocked.length, 0)
+  assert.deepStrictEqual(eventLog.diffEvents(result.pet, again.pet, T0 + 1500), [])
+})
+
+test('the event log is capped at MAX_EVENTS: 60 appends keep the newest 50, oldest dropped', () => {
+  let pet = petState.createPet(T0)
+  for (let i = 0; i < 60; i++) {
+    pet = eventLog.appendEvents(pet, [{ type: 'feed', at: T0 + i }])
+  }
+  assert.strictEqual(pet.events.length, eventLog.MAX_EVENTS)
+  assert.strictEqual(pet.events[0].at, T0 + 10, 'the oldest 10 of 60 must have been dropped')
+  assert.strictEqual(pet.events[pet.events.length - 1].at, T0 + 59, 'the newest entry is kept')
+})
+
+test('events survive a serialize/deserialize round trip; a save with no events loads as []; garbage is dropped', () => {
+  const withEvents = { ...petState.createPet(T0), events: [{ type: 'feed', at: T0 }, { type: 'sick', at: T0 + 1 }] }
+  assert.deepStrictEqual(petState.deserialize(petState.serialize(withEvents), T0 + 10).events, withEvents.events)
+
+  const rawNoEvents = JSON.stringify({
+    version: 1,
+    pet: { fullness: 33, energy: 44, fun: 55, updatedAt: T0, lastActionAt: { feed: 0, play: 0, rest: 0 } },
+  })
+  const loadedNoEvents = petState.deserialize(rawNoEvents, T0 + 1)
+  assert.deepStrictEqual(loadedNoEvents.events, [])
+  assert.strictEqual(loadedNoEvents.fullness, 33, 'stats stay intact when events is simply absent')
+  assert.strictEqual(petState.SAVE_VERSION, 1, 'adding events must not bump SAVE_VERSION')
+
+  const rawGarbage = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 33, energy: 44, fun: 55, updatedAt: T0, lastActionAt: { feed: 0, play: 0, rest: 0 },
+      events: 'not-an-array',
+    },
+  })
+  const loadedGarbage = petState.deserialize(rawGarbage, T0 + 1)
+  assert.deepStrictEqual(loadedGarbage.events, [])
+  assert.strictEqual(loadedGarbage.fullness, 33, 'stats stay intact when events is garbage')
+})
+
+test("petState's inline event coercion matches eventLog.coerceEvents, preserving unknown types, and shares its 50-event cap", () => {
+  const mixed = [
+    { type: 'feed', at: T0 },
+    { type: 'some_future_type', at: T0 + 1 },
+    { type: 'evolved', at: T0 + 2, detail: { stage: 'baby', adultForm: null } },
+    { type: 'achievement', at: T0 + 3, detail: ['not', 'a', 'plain', 'object'] },
+    { type: '', at: T0 + 4 },
+    { type: 'bad-at', at: NaN },
+    { type: 'bad-at-2', at: 'soon' },
+    'not-an-object',
+    null,
+    42,
+  ]
+  const direct = eventLog.coerceEvents(mixed)
+  const raw = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 50, energy: 50, fun: 50, updatedAt: T0, lastActionAt: { feed: 0, play: 0, rest: 0 },
+      events: mixed,
+    },
+  })
+  const viaDeserialize = petState.deserialize(raw, T0 + 1).events
+  assert.deepStrictEqual(viaDeserialize, direct)
+  assert.ok(direct.some(e => e.type === 'some_future_type'), 'unknown types must be preserved')
+  assert.ok(direct.find(e => e.type === 'achievement' && e.detail === undefined),
+    'a non-plain-object detail must be dropped, not kept')
+
+  // Cap cross-check: both sides trim to the same 50-event limit.
+  const many = []
+  for (let i = 0; i < 60; i++) many.push({ type: 'feed', at: T0 + i })
+  assert.strictEqual(eventLog.coerceEvents(many).length, eventLog.MAX_EVENTS)
+  const rawMany = JSON.stringify({
+    version: 1,
+    pet: {
+      fullness: 50, energy: 50, fun: 50, updatedAt: T0, lastActionAt: { feed: 0, play: 0, rest: 0 },
+      events: many,
+    },
+  })
+  assert.strictEqual(petState.deserialize(rawMany, T0 + 1).events.length, eventLog.MAX_EVENTS)
+})
+
+test('formatAgo boundaries: just-now window, second/minute/hour/day thresholds, and negative clamp', () => {
+  assert.strictEqual(eventLog.formatAgo(0), 'just now')
+  assert.strictEqual(eventLog.formatAgo(4999), 'just now')
+  assert.strictEqual(eventLog.formatAgo(5000), '5s ago')
+  assert.strictEqual(eventLog.formatAgo(59000), '59s ago')
+  assert.strictEqual(eventLog.formatAgo(60000), '1m ago')
+  assert.strictEqual(eventLog.formatAgo(3600000), '1h ago')
+  assert.strictEqual(eventLog.formatAgo(86400000), '1d ago')
+  assert.strictEqual(eventLog.formatAgo(-1000), 'just now')
+})
+
+test('describeEvent covers every EVENT_TYPES entry, including adult form text and achievement label lookup', () => {
+  assert.strictEqual(eventLog.describeEvent({ type: 'feed', at: T0 }), 'Fed')
+  assert.strictEqual(eventLog.describeEvent({ type: 'play', at: T0 }), 'Played')
+  assert.strictEqual(eventLog.describeEvent({ type: 'rest', at: T0 }), 'Rested')
+  assert.strictEqual(eventLog.describeEvent({ type: 'sick', at: T0 }), 'Got sick')
+  assert.strictEqual(eventLog.describeEvent({ type: 'recovered', at: T0 }), 'Recovered')
+  assert.strictEqual(
+    eventLog.describeEvent({ type: 'evolved', at: T0, detail: { stage: 'teen', adultForm: null } }),
+    'Evolved into Teen')
+  assert.strictEqual(
+    eventLog.describeEvent({ type: 'evolved', at: T0, detail: { stage: 'adult', adultForm: 'radiant' } }),
+    'Evolved into Adult (Radiant)')
+  assert.strictEqual(
+    eventLog.describeEvent({ type: 'achievement', at: T0, detail: { id: 'first_meal' } }, { achievementLabels: { first_meal: 'First Meal' } }),
+    'Unlocked: First Meal')
+  assert.strictEqual(
+    eventLog.describeEvent({ type: 'achievement', at: T0, detail: { id: 'unknown_id' } }, { achievementLabels: {} }),
+    'Unlocked: unknown_id', 'an id missing from the labels map falls back to the raw id')
+  for (const type of eventLog.EVENT_TYPES) {
+    assert.notStrictEqual(eventLog.describeEvent({ type, at: T0, detail: { stage: 'egg', id: 'x' } }), '',
+      type + ' must produce non-empty display text')
+  }
+  assert.strictEqual(eventLog.describeEvent({ type: 'some_future_type', at: T0 }), 'some_future_type',
+    'an unknown type falls back to the raw type string')
+})
+
+test('App.js renders EventLogPanel and calls recordTransition in both the tick body and handleAction', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'App.js'), 'utf8')
+  assert.ok(/<EventLogPanel\b/.test(src), 'App.js must render <EventLogPanel>')
+  const handlerAt = src.indexOf('const handleAction')
+  assert.notStrictEqual(handlerAt, -1, 'App.js must define handleAction')
+  const callSites = []
+  let searchFrom = 0
+  while (true) {
+    const at = src.indexOf('recordTransition', searchFrom)
+    if (at === -1) break
+    callSites.push(at)
+    searchFrom = at + 1
+  }
+  assert.ok(callSites.length >= 2, 'recordTransition must be called at least twice (tick + action)')
+  assert.ok(callSites.some(at => at < handlerAt), 'recordTransition must be called in the tick interval body')
+  assert.ok(callSites.some(at => at > handlerAt), 'recordTransition must be called inside handleAction')
 })
 
 async function run() {

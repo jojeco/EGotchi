@@ -78,7 +78,34 @@ function createPet(now = Date.now()) {
     adultForm: null,
     history: { feeds: 0, plays: 0, rests: 0, timesSick: 0, recoveries: 0, careStreakMs: 0, bestCareStreakMs: 0 },
     achievements: {},
+    events: [],
   }
+}
+
+// Event-log cap, duplicated (not required) from game/eventLog.js's MAX_EVENTS so this file stays
+// import-free. A test cross-checks the two constants stay in sync.
+const MAX_EVENTS = 50
+
+function isPlainObject(x) {
+  return x !== null && typeof x === 'object' && !Array.isArray(x)
+}
+
+// Pure: canonical event-list coercion, identical to game/eventLog.js's coerceEvents. A non-array
+// gives []. Otherwise keep plain-object entries with a non-empty string `type` and a finite `at`;
+// `detail` is kept only if it's a plain object. Trimmed to the newest MAX_EVENTS. Unknown types
+// are preserved, same precedent as unknown achievement ids surviving a round trip.
+function coerceEvents(raw) {
+  if (!Array.isArray(raw)) return []
+  const out = []
+  for (const e of raw) {
+    if (!isPlainObject(e)) continue
+    if (typeof e.type !== 'string' || e.type.length === 0) continue
+    if (typeof e.at !== 'number' || !Number.isFinite(e.at)) continue
+    const entry = { type: e.type, at: e.at }
+    if (isPlainObject(e.detail)) entry.detail = e.detail
+    out.push(entry)
+  }
+  return out.length > MAX_EVENTS ? out.slice(out.length - MAX_EVENTS) : out
 }
 
 // Pure: derives zeroSince/sick from the stats already on `pet`. Sickness is sticky — it only
@@ -288,6 +315,7 @@ function deserialize(raw, now = Date.now()) {
       adultForm,
       history: coerceHistory(p.history),
       achievements,
+      events: coerceEvents(p.events),
     }
     // Reconcile stage/adultForm against ageMs (handles inconsistent/tampered combinations the
     // same way a live pet's applyDecay would: stage never moves backwards, adultForm is only

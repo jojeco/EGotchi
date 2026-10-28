@@ -42,8 +42,17 @@
   30-minute unbroken care streak, and all three stats at 95+ at once).
   `Components/AchievementsPanel.js` shows unlock progress and a brief toast in `App.js`, wired in
   right alongside the existing stage-evolution banner.
-- An event/history log built on top of the `history` counters — a simple timestamped feed of
-  what the pet did and when, instead of just the running totals.
+- [x] An event/history log built on top of the `history` counters — a simple timestamped feed of
+  what the pet did and when, instead of just the running totals. Done: `game/eventLog.js` diffs
+  a pet's state before/after a tick, action or load to derive feed/play/rest, sick/recovered,
+  evolution (including adult form) and achievement-unlock events, keeps only the newest 50, and
+  gives display-text/relative-time helpers. `game/petState.js` stores `events` on the pet
+  (an old save with none loads as `[]`, stats intact, no `SAVE_VERSION` bump) and reuses the
+  same trim/coercion rule as `eventLog.js`. `Components/EventLogPanel.js` shows a collapsible
+  "Recent activity" list of the 10 newest, styled like `AchievementsPanel.js`, wired into
+  `App.js`'s load/tick/action handlers.
+- Sickness/evolution/unlocks that happen during an offline gap are logged all at once, at load
+  time — the log doesn't reconstruct the exact moment each one happened while the app was closed.
 - Add a small component/integration test (or at least a bundle check) for `App.js`; today
   only the pure `game/` modules are covered.
 - `App.js` now saves on an `AppState` background/inactive transition (in addition to the

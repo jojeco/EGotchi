@@ -7,9 +7,11 @@ import ActionButtons from './Components/ActionButtons';
 import SickBanner from './Components/SickBanner';
 import StageBadge from './Components/StageBadge';
 import AchievementsPanel from './Components/AchievementsPanel';
+import EventLogPanel from './Components/EventLogPanel';
 import petState from './game/petState';
 import storage from './game/storage';
 import achievements from './game/achievements';
+import eventLog from './game/eventLog';
 
 const TICK_INTERVAL_MS = 1000;
 const SAVE_INTERVAL_MS = 10000;
@@ -30,6 +32,10 @@ const store = localStore
   : storage.createMemoryStorage()
 
 const ACTION_LIST = Object.values(petState.ACTIONS)
+const ACHIEVEMENT_LABELS = achievements.ACHIEVEMENTS.reduce((acc, a) => {
+  acc[a.id] = a.label
+  return acc
+}, {})
 
 export default function App() {
   const [pet, setPet] = useState(() => petState.createPet())
@@ -87,14 +93,19 @@ export default function App() {
     storage.loadPet(store, Date.now(), petState).then(loaded => {
       if (cancelled) return
       const current = Date.now()
-      petRef.current = petState.applyDecay(loaded, current)
+      const decayed = petState.applyDecay(loaded, current)
+      petRef.current = decayed
       // Seed from the loaded pet's stage (not the throwaway fresh pet's), so a save that's
       // already past Egg doesn't fire a bogus evolution banner on first render.
-      stageIndexRef.current = petState.getStageInfo(petRef.current).index
+      stageIndexRef.current = petState.getStageInfo(decayed).index
       // Silent: an old save may already satisfy several achievements that didn't exist yet when
       // it was written, and those shouldn't all fire toasts the instant the app opens.
-      noteAchievements(petRef.current, current, true)
-      setPet(petRef.current)
+      const evaluated = noteAchievements(decayed, current, true)
+      // Diffed against the pre-decay load so sickness, evolution and backfilled unlocks that
+      // happened offline show up in the log too.
+      const recorded = eventLog.recordTransition(loaded, evaluated, current)
+      petRef.current = recorded
+      setPet(recorded)
       setNow(current)
       setReady(true)
     })
@@ -105,10 +116,16 @@ export default function App() {
     if (!ready) return undefined
     const id = setInterval(() => {
       const current = Date.now()
-      petRef.current = petState.applyDecay(petRef.current, current)
-      noteStage(petRef.current)
-      noteAchievements(petRef.current, current, false)
-      setPet(petRef.current)
+      const prev = petRef.current
+      const decayed = petState.applyDecay(prev, current)
+      petRef.current = decayed
+      noteStage(decayed)
+      const evaluated = noteAchievements(decayed, current, false)
+      // Must overwrite petRef.current with the logged pet, or the periodic save below would
+      // silently erase this event with the stale (pre-log) state.
+      const recorded = eventLog.recordTransition(prev, evaluated, current)
+      petRef.current = recorded
+      setPet(recorded)
       setNow(current)
     }, TICK_INTERVAL_MS)
     return () => clearInterval(id)
@@ -134,14 +151,19 @@ export default function App() {
     // would be silently discarded by the in-flight load (and would overwrite the save first).
     if (!ready) return
     const current = Date.now()
-    const result = petState.applyAction(petRef.current, id, current)
+    const prev = petRef.current
+    const result = petState.applyAction(prev, id, current)
     if (!result.applied) return
     petRef.current = result.pet
     noteStage(petRef.current)
     const evaluated = noteAchievements(petRef.current, current, false)
-    setPet(evaluated)
+    // Must overwrite petRef.current with the logged pet, or the periodic save would silently
+    // erase this event with the stale (pre-log) state.
+    const recorded = eventLog.recordTransition(prev, evaluated, current)
+    petRef.current = recorded
+    setPet(recorded)
     setNow(current)
-    storage.savePet(store, evaluated, petState)
+    storage.savePet(store, recorded, petState)
   }
 
   const cooldowns = {}
@@ -166,6 +188,7 @@ export default function App() {
       </View>
       <ActionButtons actions={ACTION_LIST} onPress={handleAction} cooldowns={cooldowns} disabled={!ready}/>
       <AchievementsPanel list={achievementList} progress={achievementProgress} toast={achievementToast}/>
+      <EventLogPanel events={eventLog.getRecentEvents(pet)} now={now} achievementLabels={ACHIEVEMENT_LABELS}/>
       <StatusBar style="auto" />
     </View>
   );

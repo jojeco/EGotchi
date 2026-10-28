@@ -50,6 +50,13 @@ even if the pet is neglected afterward. `Components/AchievementsPanel.js` shows 
 "Achievements X/Y" summary that expands into the full list, and a brief "Unlocked: ...!" toast
 appears the moment a new one lands.
 
+## Activity Log
+
+`game/eventLog.js` derives a timestamped feed/play/rest/sick/recovered/evolved/achievement log by
+diffing the pet's state before and after each tick, action or load, so nothing has to be emitted
+by hand. Only the newest 50 events are kept. `Components/EventLogPanel.js` shows a tappable
+"Recent activity" summary that expands into the 10 newest entries with a relative "Xm ago" time.
+
 ## Persistence
 
 The persistence layer is built and unit tested: `game/petState.js` serializes and deserializes the pet (versioned, falls back to a fresh pet on bad data), and `game/storage.js` provides `loadPet`/`savePet` on top of an injectable storage adapter (memory, localStorage, or an AsyncStorage-like module).
