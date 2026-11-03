@@ -17,13 +17,20 @@
   mechanics. Done: the game is now a three-stat model (fullness / energy / fun) with distinct
   Feed, Play and Rest actions, per-action cooldowns and timestamp-based decay, all in pure
   CommonJS modules under `game/` that are unit-tested with `npm test`.
-- Persistence is only half done. The persistence *layer* is built and tested
+- [x] Persistence is only half done. The persistence *layer* is built and tested
   (`serialize` / `deserialize` / `loadPet` / `savePet` with an injectable storage adapter, plus
   timestamp-based offline decay capped by `MAX_OFFLINE_MS`), and `createLocalStorageAdapter`
   gives real persistence on Expo web. Native builds still use the in-memory store, so the pet
   resets on every app restart there. Wire a real backend
   (`@react-native-async-storage/async-storage` via `createAsyncStorageAdapter`; needs a
-  dependency addition, so flag to a human first).
+  dependency addition, so flag to a human first). Done: `game/storage.js` now exports a pure
+  `pickStorage({ localStorage, asyncStorage })` that prefers `localStorage` (web), then an
+  injected AsyncStorage module (native), then falls back to the in-memory store, with
+  `.default` ESM-interop handling for either backend. `App.js` wires `AsyncStorage` from the
+  new `@react-native-async-storage/async-storage` dependency through it, so native saves/loads
+  now actually survive an app restart. `npx expo install` couldn't run here (no `node_modules`/
+  `expo` present in this checkout), so the dependency was hand-added to `package.json` at
+  `1.21.0` and `package-lock.json` was synced with `npm install --package-lock-only`.
 - [x] Evolution stages driven by long-run average care, layered on `getMoodIndex`. Done:
   `game/petState.js` ages the pet through Egg -> Baby -> Child -> Teen -> Adult based on `ageMs`
   (cumulative time seen by `applyDecay`, so it respects the `MAX_OFFLINE_MS` cap the same as
@@ -55,7 +62,9 @@
   time — the log doesn't reconstruct the exact moment each one happened while the app was closed.
 - Add a small component/integration test (or at least a bundle check) for `App.js`; today
   only the pure `game/` modules are covered.
-- `App.js` now saves on an `AppState` background/inactive transition (in addition to the
+- [x] `App.js` now saves on an `AppState` background/inactive transition (in addition to the
   interval and action saves), but on native that still writes through the in-memory store
   from the persistence TODO above, so a true app kill after backgrounding still loses state;
-  wiring the AsyncStorage adapter would close that gap.
+  wiring the AsyncStorage adapter would close that gap. Done: with `pickStorage` wiring
+  AsyncStorage on native (see above), the AppState background save now writes through a real
+  backend there too, so a kill after backgrounding no longer loses state.

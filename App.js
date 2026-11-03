@@ -1,6 +1,7 @@
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useRef, useState } from 'react';
 import { AppState, StyleSheet, Text, View } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import Face, { FACE_LABELS } from './Components/Face';
 import StatBar from './Components/StatBar';
 import ActionButtons from './Components/ActionButtons';
@@ -18,7 +19,7 @@ const SAVE_INTERVAL_MS = 10000;
 const EVOLVE_BANNER_MS = 3000;
 const ACHIEVEMENT_TOAST_MS = 3000;
 
-// Real persistence on Expo web (localStorage); native falls back to memory until a backend is wired.
+// Real persistence everywhere: localStorage on web, AsyncStorage on native, in-memory as a last resort.
 const getLocalStorage = () => {
   try {
     return typeof localStorage !== 'undefined' ? localStorage : null
@@ -26,10 +27,7 @@ const getLocalStorage = () => {
     return null
   }
 }
-const localStore = getLocalStorage()
-const store = localStore
-  ? storage.createLocalStorageAdapter(localStore)
-  : storage.createMemoryStorage()
+const { store } = storage.pickStorage({ localStorage: getLocalStorage(), asyncStorage: AsyncStorage })
 
 const ACTION_LIST = Object.values(petState.ACTIONS)
 const ACHIEVEMENT_LABELS = achievements.ACHIEVEMENTS.reduce((acc, a) => {

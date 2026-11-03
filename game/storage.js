@@ -32,6 +32,34 @@ function createLocalStorageAdapter(ls) {
   }
 }
 
+// Unwraps ESM-interop default exports (e.g. `require('...async-storage').default`).
+function unwrapModule(mod) {
+  return mod && (mod.default || mod)
+}
+
+// True when `candidate` exposes getItem/setItem/removeItem as functions.
+function isUsableStorage(candidate) {
+  return !!candidate &&
+    typeof candidate.getItem === 'function' &&
+    typeof candidate.setItem === 'function' &&
+    typeof candidate.removeItem === 'function'
+}
+
+// Picks the best available persistence backend: localStorage (web) first, then an injected
+// AsyncStorage module (native), then an in-memory fallback so the app never crashes without one.
+// Returns { kind, store } so callers/tests can tell which backend was chosen.
+function pickStorage({ localStorage, asyncStorage } = {}) {
+  const ls = unwrapModule(localStorage)
+  if (isUsableStorage(ls)) {
+    return { kind: 'local', store: createLocalStorageAdapter(ls) }
+  }
+  const as = unwrapModule(asyncStorage)
+  if (isUsableStorage(as)) {
+    return { kind: 'async', store: createAsyncStorageAdapter(as) }
+  }
+  return { kind: 'memory', store: createMemoryStorage() }
+}
+
 // Never throws: any storage or codec failure yields a fresh pet.
 async function loadPet(storage, now, codec) {
   try {
@@ -56,6 +84,7 @@ module.exports = {
   createMemoryStorage,
   createAsyncStorageAdapter,
   createLocalStorageAdapter,
+  pickStorage,
   loadPet,
   savePet,
 }

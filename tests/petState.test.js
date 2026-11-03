@@ -24,8 +24,59 @@ test('petState exports every symbol App.js and storage.js rely on', () => {
 
 test('storage exports every symbol App.js relies on', () => {
   const names = ['STORAGE_KEY', 'createMemoryStorage', 'createAsyncStorageAdapter',
-    'createLocalStorageAdapter', 'loadPet', 'savePet']
+    'createLocalStorageAdapter', 'pickStorage', 'loadPet', 'savePet']
   for (const n of names) assert.notStrictEqual(storage[n], undefined, 'storage missing ' + n)
+})
+
+function fakeSyncStorage() {
+  const data = new Map()
+  return {
+    getItem: k => (data.has(k) ? data.get(k) : null),
+    setItem: (k, v) => { data.set(k, String(v)) },
+    removeItem: k => { data.delete(k) },
+  }
+}
+
+function fakeAsyncStorage() {
+  const data = new Map()
+  return {
+    getItem: async k => (data.has(k) ? data.get(k) : null),
+    setItem: async (k, v) => { data.set(k, String(v)) },
+    removeItem: async k => { data.delete(k) },
+  }
+}
+
+test('pickStorage prefers localStorage when both localStorage and asyncStorage are usable', () => {
+  const result = storage.pickStorage({ localStorage: fakeSyncStorage(), asyncStorage: fakeAsyncStorage() })
+  assert.strictEqual(result.kind, 'local')
+})
+
+test('pickStorage picks AsyncStorage when localStorage is null', () => {
+  const result = storage.pickStorage({ localStorage: null, asyncStorage: fakeAsyncStorage() })
+  assert.strictEqual(result.kind, 'async')
+})
+
+test('pickStorage unwraps an ESM-interop .default export for either backend', () => {
+  const localResult = storage.pickStorage({ localStorage: { default: fakeSyncStorage() }, asyncStorage: null })
+  assert.strictEqual(localResult.kind, 'local')
+  const asyncResult = storage.pickStorage({ localStorage: null, asyncStorage: { default: fakeAsyncStorage() } })
+  assert.strictEqual(asyncResult.kind, 'async')
+})
+
+test('pickStorage falls back to memory when neither backend is given, or one is missing a method', () => {
+  assert.strictEqual(storage.pickStorage().kind, 'memory')
+  assert.strictEqual(storage.pickStorage({}).kind, 'memory')
+  const brokenLocal = { getItem: () => null, setItem: () => {} } // no removeItem
+  const result = storage.pickStorage({ localStorage: brokenLocal, asyncStorage: null })
+  assert.strictEqual(result.kind, 'memory')
+})
+
+test('pickStorage: a full save -> load round trip through the async choice returns the same pet', async () => {
+  const { kind, store } = storage.pickStorage({ localStorage: null, asyncStorage: fakeAsyncStorage() })
+  assert.strictEqual(kind, 'async')
+  const pet = petState.applyAction(petState.createPet(T0), 'feed', T0).pet
+  assert.deepStrictEqual(await storage.savePet(store, pet, petState), { ok: true })
+  assert.deepStrictEqual(await storage.loadPet(store, T0 + 1, petState), pet)
 })
 
 test('MOOD_COUNT matches the number of faces in Components/Face.js', () => {
