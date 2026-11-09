@@ -56,12 +56,14 @@ appears the moment a new one lands.
 diffing the pet's state before and after each tick, action or load, so nothing has to be emitted
 by hand. Only the newest 50 events are kept. `Components/EventLogPanel.js` shows a tappable
 "Recent activity" summary that expands into the 10 newest entries with a relative "Xm ago" time.
+Sick and evolved events that happened while the app was closed carry the real offline moment they
+occurred, not the moment the save was loaded.
 
 ## Persistence
 
 The persistence layer is built and unit tested: `game/petState.js` serializes and deserializes the pet (versioned, falls back to a fresh pet on bad data), and `game/storage.js` provides `loadPet`/`savePet` on top of an injectable storage adapter (memory, localStorage, or an AsyncStorage-like module).
 
-Durable persistence currently works on **Expo web only**, where `App.js` uses `localStorage`. On native platforms the app falls back to an in-memory store, so the pet is **not** saved across app restarts there until a real storage backend is wired in.
+Durable persistence works on both platforms: `game/storage.js`'s `pickStorage` picks `localStorage` on web and `@react-native-async-storage/async-storage` on native, falling back to an in-memory store only if neither is available.
 
 ## Running
 

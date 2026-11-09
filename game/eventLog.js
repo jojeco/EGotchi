@@ -1,10 +1,18 @@
 // Timestamped activity log, built by diffing a pet's state before/after a tick, action or load.
 // CommonJS, no imports — kept standalone like game/achievements.js, so callers (App.js, tests)
 // pass the pet objects straight in and this module never requires game/petState.js.
+// Sick/evolved events carry the real offline moment they happened (not the load-time `now`),
+// and the returned batch is time-sorted ascending.
 'use strict'
 
 const MAX_EVENTS = 50
 const EVENT_TYPES = ['feed', 'play', 'rest', 'sick', 'recovered', 'evolved', 'achievement']
+
+// Duplicated (not required) from game/petState.js, same approach as MAX_EVENTS above, so this
+// module stays import-free. Used to recover the real offline moment a sick/evolved event
+// happened, matching the timing applyDecay itself uses.
+const SICK_AFTER_MS = 2 * 60e3
+const STAGE_AGE_MS = { egg: 0, baby: 2 * 60e3, child: 10 * 60e3, teen: 30 * 60e3, adult: 60 * 60e3 }
 
 // Mirrors the counter -> event-type mapping App.js cares about. Order here also drives the
 // "actions first" ordering within a single diffEvents batch.
@@ -32,7 +40,17 @@ function capitalize(s) {
   return typeof s === 'string' && s.length > 0 ? s.charAt(0).toUpperCase() + s.slice(1) : s
 }
 
-// Pure: never throws. Order within one batch: actions, sick/recovered, evolved, achievements.
+// Clamps `t` into [lo, hi]; falls back to `fallback` when `t` isn't a finite number (a missing
+// or garbage source field on the pet).
+function clampAt(t, lo, hi, fallback) {
+  if (typeof t !== 'number' || !Number.isFinite(t)) return fallback
+  return Math.min(Math.max(t, lo), hi)
+}
+
+// Pure: never throws. Sick/evolved events carry the real offline moment they happened (derived
+// from zeroSince/ageMs, same as applyDecay), not the load-time `now` — clamped into
+// [prev.updatedAt, now] so a bad/missing timestamp can't escape that window. The returned batch
+// is sorted by `at` ascending before it's handed back.
 function diffEvents(prev, next, now) {
   const events = []
   const prevHistory = historyOf(prev)
@@ -43,9 +61,18 @@ function diffEvents(prev, next, now) {
     for (let i = 0; i < delta; i++) events.push({ type, at: now })
   }
 
-  const sickDelta = Math.max((nextHistory.timesSick || 0) - (prevHistory.timesSick || 0), 0)
-  for (let i = 0; i < sickDelta; i++) events.push({ type: 'sick', at: now })
+  // Lower clamp bound for the real-time calcs below: the start of this diff's window.
+  const lo = (prev && typeof prev.updatedAt === 'number' && Number.isFinite(prev.updatedAt)) ? prev.updatedAt : now
 
+  const sickDelta = Math.max((nextHistory.timesSick || 0) - (prevHistory.timesSick || 0), 0)
+  if (sickDelta > 0) {
+    const zeroSince = next && typeof next.zeroSince === 'number' && Number.isFinite(next.zeroSince) ? next.zeroSince : null
+    const sickAt = zeroSince === null ? now : clampAt(zeroSince + SICK_AFTER_MS, lo, now, now)
+    for (let i = 0; i < sickDelta; i++) events.push({ type: 'sick', at: sickAt })
+  }
+
+  // Recovery can't be derived from decay alone (it depends on care actions taken after the
+  // zero-crossing), so it stays stamped at `now`.
   const recoveredDelta = Math.max((nextHistory.recoveries || 0) - (prevHistory.recoveries || 0), 0)
   for (let i = 0; i < recoveredDelta; i++) events.push({ type: 'recovered', at: now })
 
@@ -56,7 +83,18 @@ function diffEvents(prev, next, now) {
   const nextStage = next && typeof next.stage === 'string' ? next.stage : 'egg'
   if (nextStage !== prevStage) {
     const adultForm = nextStage === 'adult' && next.adultForm ? next.adultForm : null
-    events.push({ type: 'evolved', at: now, detail: { stage: nextStage, adultForm } })
+    const prevAgeMs = prev ? prev.ageMs : undefined
+    const nextAgeMs = next ? next.ageMs : undefined
+    // Only derive a real-time boundary crossing when ageMs actually advanced (a genuine offline
+    // gap). A stage-only reassignment with no age change (e.g. a direct updateStage call in a
+    // test) has no decay window to anchor on, so it keeps the `now` stamp.
+    const agesAdvanced = typeof prevAgeMs === 'number' && Number.isFinite(prevAgeMs) &&
+      typeof nextAgeMs === 'number' && Number.isFinite(nextAgeMs) && nextAgeMs > prevAgeMs &&
+      Object.prototype.hasOwnProperty.call(STAGE_AGE_MS, nextStage)
+    const evolvedAt = agesAdvanced
+      ? clampAt(prev.updatedAt + (STAGE_AGE_MS[nextStage] - prevAgeMs), lo, now, now)
+      : now
+    events.push({ type: 'evolved', at: evolvedAt, detail: { stage: nextStage, adultForm } })
   }
 
   const prevAchievements = achievementsOf(prev)
@@ -67,6 +105,7 @@ function diffEvents(prev, next, now) {
     events.push({ type: 'achievement', at, detail: { id } })
   }
 
+  events.sort((a, b) => a.at - b.at)
   return events
 }
 
@@ -144,6 +183,8 @@ function getRecentEvents(pet, limit) {
 module.exports = {
   MAX_EVENTS,
   EVENT_TYPES,
+  SICK_AFTER_MS,
+  STAGE_AGE_MS,
   diffEvents,
   appendEvents,
   recordTransition,

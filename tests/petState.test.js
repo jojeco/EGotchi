@@ -924,7 +924,9 @@ test('decay that makes the pet sick logs one sick event; recovering logs one rec
   const afterAt = T0 + 180000 + 5000
   const sickened = petState.applyDecay(base, afterAt)
   assert.strictEqual(sickened.sick, true)
-  assert.deepStrictEqual(eventLog.diffEvents(base, sickened, afterAt), [{ type: 'sick', at: afterAt }])
+  // Real offline moment, not load time: fullness crosses 0 at T0+60000 (zeroSince), and the pet
+  // is marked sick SICK_AFTER_MS (120000) later, i.e. T0+180000 — not `afterAt` (T0+185000).
+  assert.deepStrictEqual(eventLog.diffEvents(base, sickened, afterAt), [{ type: 'sick', at: T0 + 180000 }])
 
   const prevSick = { ...petState.createPet(T0), sick: true, fullness: 39, energy: 39, fun: 39 }
   const recovered = petState.updateHealth({ ...prevSick, fullness: 40, energy: 40, fun: 40 }, T0 + 1000)
@@ -947,6 +949,54 @@ test('crossing Egg->Baby logs evolved with detail.stage; reaching Adult sets det
   assert.strictEqual(adult.adultForm, 'radiant')
   assert.deepStrictEqual(eventLog.diffEvents(teen, adult, T0 + adultAge),
     [{ type: 'evolved', at: T0 + adultAge, detail: { stage: 'adult', adultForm: 'radiant' } }])
+})
+
+test('eventLog duplicates SICK_AFTER_MS/STAGE_AGE_MS in sync with petState', () => {
+  assert.strictEqual(eventLog.SICK_AFTER_MS, petState.SICK_AFTER_MS)
+  assert.deepStrictEqual(eventLog.STAGE_AGE_MS, petState.STAGE_AGE_MS)
+})
+
+test('an offline evolve logs the real stage-boundary moment, not load time', () => {
+  const base = petState.createPet(T0)
+  const loadedAt = T0 + 5 * 60e3 // 5 minutes offline, no stat hits 0
+  const next = petState.applyDecay(base, loadedAt)
+  assert.strictEqual(next.stage, 'baby')
+  const events = eventLog.diffEvents(base, next, loadedAt)
+  assert.deepStrictEqual(events, [{ type: 'evolved', at: T0 + petState.STAGE_AGE_MS.baby, detail: { stage: 'baby', adultForm: null } }])
+})
+
+test('an offline gap producing both a sick and an evolved event returns them time-sorted', () => {
+  const base = petState.createPet(T0)
+  const loadedAt = T0 + 15 * 60e3 // 15 minutes offline: crosses into Child and goes Sick
+  const next = petState.applyDecay(base, loadedAt)
+  assert.strictEqual(next.stage, 'child')
+  assert.strictEqual(next.sick, true)
+  const events = eventLog.diffEvents(base, next, loadedAt)
+  assert.deepStrictEqual(events.map(e => e.type), ['evolved', 'sick'])
+  for (let i = 1; i < events.length; i++) {
+    assert.ok(events[i].at >= events[i - 1].at, 'events must be sorted ascending by at')
+  }
+})
+
+test('a gap beyond the 12h MAX_OFFLINE_MS cap still keeps every event at within [prev.updatedAt, now]', () => {
+  const base = petState.createPet(T0)
+  const loadedAt = T0 + 20 * 3600e3 // 20 hours offline, beyond MAX_OFFLINE_MS
+  const next = petState.applyDecay(base, loadedAt)
+  const events = eventLog.diffEvents(base, next, loadedAt)
+  assert.ok(events.length > 0, 'expected at least one sick/evolved event in this scenario')
+  for (const e of events) {
+    assert.ok(e.at >= base.updatedAt && e.at <= loadedAt, 'event ' + e.type + ' at ' + e.at + ' escaped the [prev.updatedAt, now] window')
+  }
+})
+
+test('diffEvents never throws on a pet missing updatedAt/zeroSince/ageMs, and falls back to at = now', () => {
+  const prev = { history: { timesSick: 0 }, stage: 'egg' }
+  const next = { history: { timesSick: 1 }, stage: 'baby' } // updatedAt/zeroSince/ageMs all absent
+  const now = T0 + 999
+  let events
+  assert.doesNotThrow(() => { events = eventLog.diffEvents(prev, next, now) })
+  assert.deepStrictEqual(events.find(e => e.type === 'sick'), { type: 'sick', at: now })
+  assert.strictEqual(events.find(e => e.type === 'evolved').at, now)
 })
 
 test('a new achievement unlock logs an achievement event at its stored unlock timestamp; re-evaluating does not duplicate', () => {

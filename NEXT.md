@@ -58,8 +58,13 @@
   same trim/coercion rule as `eventLog.js`. `Components/EventLogPanel.js` shows a collapsible
   "Recent activity" list of the 10 newest, styled like `AchievementsPanel.js`, wired into
   `App.js`'s load/tick/action handlers.
-- Sickness/evolution/unlocks that happen during an offline gap are logged all at once, at load
-  time — the log doesn't reconstruct the exact moment each one happened while the app was closed.
+- [x] Sickness/evolution that happen during an offline gap were logged all at once, at load time,
+  instead of the exact moment each one happened while the app was closed. Done: `diffEvents` in
+  `game/eventLog.js` now derives the real moment for `sick` (`zeroSince + SICK_AFTER_MS`) and
+  `evolved` (the stage-boundary crossing from `prev.updatedAt`/`ageMs`) events, clamped into
+  `[prev.updatedAt, now]`, and sorts the returned batch by `at` ascending.
+- Achievements unlocked while offline are still stamped at load time (not their real offline
+  moment), because `evaluateAchievements` runs after decay — still open.
 - Add a small component/integration test (or at least a bundle check) for `App.js`; today
   only the pure `game/` modules are covered.
 - [x] `App.js` now saves on an `AppState` background/inactive transition (in addition to the
